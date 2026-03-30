@@ -1,30 +1,126 @@
 import os
 import io
 import json
+import re as _re_validate
 import uuid
 import shutil
 import base64
+import time
+import logging
+import asyncio
+import threading
 from pathlib import Path
 from typing import Optional
+from contextlib import asynccontextmanager
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="AI PDF Editor API")
+from backend import document_intelligence as doc_intel
+from backend.smart_replace import (
+    smart_replace_in_doc,
+    smart_replace_on_page,
+    smart_replace,
+    validate_replacement,
+    _find_matching_spans,
+    _extract_span_style,
+    _resolve_font_code,
+    _compute_replacement_size,
+    hex_color_to_rgb as _sr_hex_color_to_rgb,
+)
+from backend.advanced_ops import router as advanced_router, snapshot
+
+# ─── Configuration ─────────────────────────────────────────────────────────
+
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "uploads"))
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+FILE_TTL_HOURS = int(os.environ.get("FILE_TTL_HOURS", "24"))
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+AI_RATE_LIMIT_RPM = int(os.environ.get("AI_RATE_LIMIT_RPM", "30"))
+MAX_TEXT_INPUT_LENGTH = int(os.environ.get("MAX_TEXT_INPUT_LENGTH", "10000"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("pdf-editor")
+
+_UUID_RE = _re_validate.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _validate_doc_id(doc_id: str):
+    """Prevent path traversal by validating doc_id is a UUID."""
+    if not _UUID_RE.match(doc_id):
+        raise HTTPException(status_code=400, detail="Invalid document ID")
+
+
+async def _cleanup_old_files():
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            cutoff = time.time() - FILE_TTL_HOURS * 3600
+            if UPLOAD_DIR.exists():
+                for doc_dir in UPLOAD_DIR.iterdir():
+                    if doc_dir.is_dir():
+                        pdf = doc_dir / "original.pdf"
+                        if pdf.exists() and pdf.stat().st_mtime < cutoff:
+                            shutil.rmtree(doc_dir)
+                            logger.info("Cleaned up expired document: %s", doc_dir.name)
+        except Exception as e:
+            logger.error("Cleanup error: %s", e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    cleanup_task = asyncio.create_task(_cleanup_old_files())
+    yield
+    cleanup_task.cancel()
+
+
+app = FastAPI(title="AI PDF Editor API", lifespan=lifespan)
+app.include_router(advanced_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    ms = (time.time() - start) * 1000
+    logger.info("%s %s %d %.1fms", request.method, request.url.path, response.status_code, ms)
+    return response
+
+
+_ai_request_times: list[float] = []
+
+
+def _check_ai_rate_limit():
+    now = time.time()
+    while _ai_request_times and _ai_request_times[0] < now - 60.0:
+        _ai_request_times.pop(0)
+    if len(_ai_request_times) >= AI_RATE_LIMIT_RPM:
+        raise HTTPException(status_code=429, detail=f"AI rate limit exceeded ({AI_RATE_LIMIT_RPM} req/min).")
+    _ai_request_times.append(now)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled error on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "upload_dir_exists": UPLOAD_DIR.exists()}
 
 
 # ─── Models ─────────────────────────────────────────────────────────────────
@@ -105,6 +201,7 @@ class AIAssistRequest(BaseModel):
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def get_doc_path(doc_id: str) -> Path:
+    _validate_doc_id(doc_id)
     path = UPLOAD_DIR / doc_id / "original.pdf"
     if not path.exists():
         raise HTTPException(status_code=404, detail="Document not found")
@@ -148,6 +245,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     file_path = doc_dir / "original.pdf"
     content = await file.read()
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        shutil.rmtree(doc_dir)
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE_MB}MB.")
     with open(file_path, "wb") as f:
         f.write(content)
 
@@ -159,9 +259,19 @@ async def upload_pdf(file: UploadFile = File(...)):
     metadata = doc.metadata
     doc.close()
 
+    # Trigger background document analysis
+    threading.Thread(
+        target=doc_intel.run_full_analysis,
+        args=(doc_id,),
+        daemon=True,
+    ).start()
+
+    # Sanitize filename — strip path components
+    safe_name = os.path.basename(file.filename).strip() if file.filename else "document.pdf"
+
     return {
         "id": doc_id,
-        "filename": file.filename,
+        "filename": safe_name,
         "page_count": page_count,
         "metadata": metadata,
     }
@@ -268,6 +378,7 @@ async def get_text(doc_id: str, page_num: Optional[int] = None):
 @app.post("/api/pdf/{doc_id}/text/edit")
 async def edit_text(doc_id: str, req: TextEditRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Edit text")
     doc = fitz.open(str(file_path))
 
     if req.page < 0 or req.page >= len(doc):
@@ -277,39 +388,48 @@ async def edit_text(doc_id: str, req: TextEditRequest):
     page = doc[req.page]
     rect = fitz.Rect(req.bbox[0], req.bbox[1], req.bbox[2], req.bbox[3])
 
-    # Determine font properties from existing text at that location
-    font_size = req.font_size or 11
-    font_name = "helv"  # Default to Helvetica
-    text_color = (0, 0, 0)
+    # Extract formatting from existing text at that location
+    styles = _find_matching_spans(page, rect)
 
     if req.color:
         text_color = tuple(req.color[:3])
+    elif styles:
+        text_color = styles[0].color
+    else:
+        text_color = (0, 0, 0)
 
-    # If no explicit font size, try to detect from existing content
-    if not req.font_size:
-        blocks = page.get_text("dict")["blocks"]
-        for block in blocks:
-            if block["type"] == 0:
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        span_rect = fitz.Rect(span["bbox"])
-                        if span_rect.intersects(rect):
-                            font_size = span["size"]
-                            text_color = hex_color_to_rgb(span["color"])
-                            break
+    # FIX #1: Resolve font code from original span's flags (not hardcoded "helv")
+    if styles:
+        font_code = styles[0].font_code
+        font_size = req.font_size if req.font_size else styles[0].font_size
+        baseline_origin = styles[0].origin  # (x, y) baseline point
+    else:
+        font_code = "helv"
+        font_size = req.font_size if req.font_size else 11
+        baseline_origin = None
 
-    # Redact the area and re-insert text
-    page.add_redact_annot(rect)
-    page.apply_redactions()
+    font = fitz.Font(font_code)
 
-    # Insert new text with matched formatting
+    # FIX #2: Measure width and scale down if needed
+    adjusted_size, _ = _compute_replacement_size(
+        font, "", req.new_text, font_size, rect.width,
+    )
+
+    # Redact only the exact bbox, preserve nearby images
+    page.add_redact_annot(rect, fill=(1, 1, 1))
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+    # FIX #3: Insert at baseline origin, not bbox top
+    if baseline_origin:
+        insert_point = fitz.Point(rect.x0, baseline_origin[1])
+    else:
+        # Fallback: approximate baseline from bbox bottom
+        insert_point = fitz.Point(rect.x0, rect.y1 - (adjusted_size * 0.15))
+
     tw = fitz.TextWriter(page.rect)
-    font = fitz.Font(font_name)
-    tw.append(fitz.Point(rect.x0, rect.y0 + font_size), req.new_text,
-              font=font, fontsize=font_size)
+    tw.append(insert_point, req.new_text, font=font, fontsize=adjusted_size)
     tw.write_text(page, color=text_color)
 
-    # Save non-incrementally to avoid issues with redactions
     out_path = str(file_path) + ".tmp"
     doc.save(out_path)
     doc.close()
@@ -321,6 +441,7 @@ async def edit_text(doc_id: str, req: TextEditRequest):
 @app.post("/api/pdf/{doc_id}/text/add")
 async def add_text(doc_id: str, req: AddTextRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Add text")
     doc = fitz.open(str(file_path))
 
     if req.page < 0 or req.page >= len(doc):
@@ -348,6 +469,7 @@ async def add_text(doc_id: str, req: AddTextRequest):
 async def move_resize_text(doc_id: str, req: MoveResizeRequest):
     """Move or resize a text block: extract from old_bbox, redact, re-insert at new_bbox."""
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Move/resize text")
     doc = fitz.open(str(file_path))
 
     if req.page < 0 or req.page >= len(doc):
@@ -360,18 +482,21 @@ async def move_resize_text(doc_id: str, req: MoveResizeRequest):
 
     # Collect all text spans that intersect the old rect
     spans_to_move = []
-    blocks = page.get_text("dict")["blocks"]
+    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     for block in blocks:
-        if block["type"] == 0:
+        if block.get("type", 0) == 0:
             for line in block["lines"]:
                 for span in line["spans"]:
                     span_rect = fitz.Rect(span["bbox"])
                     if old_rect.intersects(span_rect) and span["text"].strip():
+                        # FIX #1: Resolve correct font code from flags
+                        font_code = _resolve_font_code(span["font"], span["flags"])
                         spans_to_move.append({
                             "text": span["text"],
                             "size": span["size"],
                             "color": hex_color_to_rgb(span["color"]),
                             "flags": span["flags"],
+                            "font_code": font_code,
                             # Relative position within old_rect
                             "rel_x": (span["bbox"][0] - old_rect.x0) / max(old_rect.width, 1),
                             "rel_y": (span["bbox"][1] - old_rect.y0) / max(old_rect.height, 1),
@@ -392,9 +517,9 @@ async def move_resize_text(doc_id: str, req: MoveResizeRequest):
                             if old_rect.intersects(ir):
                                 base_image = doc.extract_image(xref)
                                 img_bytes = base_image["image"]
-                                # Redact old position
-                                page.add_redact_annot(ir)
-                                page.apply_redactions()
+                                # Redact old position (preserve nearby images)
+                                page.add_redact_annot(ir, fill=(1, 1, 1))
+                                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                                 # Insert at new position
                                 page.insert_image(new_rect, stream=img_bytes)
                                 out_path = str(file_path) + ".tmp"
@@ -405,18 +530,18 @@ async def move_resize_text(doc_id: str, req: MoveResizeRequest):
         doc.close()
         return {"status": "ok", "moved": "nothing"}
 
-    # Redact old area
-    page.add_redact_annot(old_rect)
-    page.apply_redactions()
+    # Redact old area (preserve nearby images)
+    page.add_redact_annot(old_rect, fill=(1, 1, 1))
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
     # Scale factor from old rect to new rect
     scale_x = new_rect.width / max(old_rect.width, 1)
     scale_y = new_rect.height / max(old_rect.height, 1)
 
-    # Re-insert text at new positions
-    font = fitz.Font("helv")
-    tw = fitz.TextWriter(page.rect)
+    # Re-insert text at new positions with correct per-span font
     for span in spans_to_move:
+        font = fitz.Font(span["font_code"])
+        tw = fitz.TextWriter(page.rect)
         new_x = new_rect.x0 + span["rel_x"] * new_rect.width
         new_y = new_rect.y0 + span["rel_y"] * new_rect.height
         new_size = span["size"] * min(scale_x, scale_y)
@@ -427,7 +552,7 @@ async def move_resize_text(doc_id: str, req: MoveResizeRequest):
             font=font,
             fontsize=new_size,
         )
-    tw.write_text(page, color=spans_to_move[0]["color"] if spans_to_move else (0, 0, 0))
+        tw.write_text(page, color=span["color"])
 
     out_path = str(file_path) + ".tmp"
     doc.save(out_path)
@@ -468,48 +593,9 @@ async def replace_text(doc_id: str, req: FindReplaceRequest):
         raise HTTPException(status_code=400, detail="replace_text required")
 
     file_path = get_doc_path(doc_id)
-    doc = fitz.open(str(file_path))
-    replaced = 0
-
-    pages = [req.page] if req.page is not None else range(len(doc))
-    for p in pages:
-        if p < 0 or p >= len(doc):
-            continue
-        page = doc[p]
-        matches = page.search_for(req.find_text)
-        if not matches:
-            continue
-
-        # Get font info from first match
-        font_size = 11
-        text_color = (0, 0, 0)
-        blocks = page.get_text("dict")["blocks"]
-        for block in blocks:
-            if block["type"] == 0:
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        span_rect = fitz.Rect(span["bbox"])
-                        if span_rect.intersects(matches[0]):
-                            font_size = span["size"]
-                            text_color = hex_color_to_rgb(span["color"])
-                            break
-
-        for rect in matches:
-            page.add_redact_annot(rect)
-        page.apply_redactions()
-
-        font = fitz.Font("helv")
-        tw = fitz.TextWriter(page.rect)
-        for rect in matches:
-            tw.append(fitz.Point(rect.x0, rect.y0 + font_size),
-                      req.replace_text, font=font, fontsize=font_size)
-            replaced += 1
-        tw.write_text(page, color=text_color)
-
-    out_path = str(file_path) + ".tmp"
-    doc.save(out_path)
-    doc.close()
-    os.replace(out_path, str(file_path))
+    snapshot(doc_id, f"Replace '{req.find_text}' with '{req.replace_text}'")
+    scope = req.page if req.page is not None else "all"
+    replaced, _ = smart_replace_in_doc(file_path, req.find_text, req.replace_text, scope)
 
     return {"status": "ok", "replaced": replaced}
 
@@ -519,6 +605,7 @@ async def replace_text(doc_id: str, req: FindReplaceRequest):
 @app.post("/api/pdf/{doc_id}/highlight")
 async def add_highlight(doc_id: str, req: HighlightRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Add highlight")
     doc = fitz.open(str(file_path))
 
     if req.page < 0 or req.page >= len(doc):
@@ -548,6 +635,7 @@ async def add_highlight(doc_id: str, req: HighlightRequest):
 @app.post("/api/pdf/{doc_id}/draw")
 async def add_drawing(doc_id: str, req: DrawingRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Add drawing")
     doc = fitz.open(str(file_path))
 
     if req.page < 0 or req.page >= len(doc):
@@ -602,6 +690,7 @@ async def save_page_annotations(doc_id: str, page_num: int, data: list = Body(..
 @app.patch("/api/pdf/{doc_id}/edit")
 async def edit_pdf(doc_id: str, req: PageOpRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, f"Page op: {req.type}")
     doc = fitz.open(str(file_path))
 
     if req.page < 0 or req.page >= len(doc):
@@ -631,6 +720,7 @@ async def edit_pdf(doc_id: str, req: PageOpRequest):
 @app.post("/api/pdf/{doc_id}/reorder")
 async def reorder_pages(doc_id: str, req: ReorderRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Reorder pages")
     doc = fitz.open(str(file_path))
     if sorted(req.page_order) != list(range(len(doc))):
         doc.close()
@@ -646,6 +736,7 @@ async def reorder_pages(doc_id: str, req: ReorderRequest):
 @app.post("/api/pdf/{doc_id}/split")
 async def split_pdf(doc_id: str, req: SplitRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Split PDF")
     doc = fitz.open(str(file_path))
     result_ids = []
     for page_range in req.page_ranges:
@@ -664,6 +755,7 @@ async def split_pdf(doc_id: str, req: SplitRequest):
 @app.post("/api/pdf/{doc_id}/merge")
 async def merge_pdfs(doc_id: str, req: MergeRequest):
     file_path = get_doc_path(doc_id)
+    snapshot(doc_id, "Merge PDFs")
     doc = fitz.open(str(file_path))
     for other_id in req.doc_ids:
         other_path = get_doc_path(other_id)
@@ -699,11 +791,113 @@ async def export_pdf(doc_id: str, flatten: bool = True):
     return FileResponse(str(file_path), media_type="application/pdf", filename="edited.pdf")
 
 
+# ─── Document Intelligence ─────────────────────────────────────────────────
+
+
+class AskQuestionRequest(BaseModel):
+    question: str
+
+
+class FillFormFieldRequest(BaseModel):
+    field_name: str
+    value: str
+
+
+@app.get("/api/pdf/{doc_id}/analysis")
+async def get_analysis(doc_id: str):
+    """Returns the full document analysis (structure, entities, tables, forms, language)."""
+    get_doc_path(doc_id)  # validate doc exists
+    cached = doc_intel.load_analysis(doc_id)
+    if cached:
+        return cached
+    # Run analysis on demand if not yet available
+    return doc_intel.run_full_analysis(doc_id)
+
+
+@app.get("/api/pdf/{doc_id}/tables")
+async def get_tables(doc_id: str, page: Optional[int] = None, format: Optional[str] = None):
+    """Returns extracted tables. Optional page filter and format=csv."""
+    get_doc_path(doc_id)
+    tables = doc_intel.extract_tables(doc_id)
+    if page is not None:
+        tables = [t for t in tables if t["page"] == page]
+    if format == "csv" and tables:
+        csv_parts = []
+        for t in tables:
+            csv_parts.append(f"# Table on page {t['page'] + 1} (index {t['table_index']})")
+            csv_parts.append(doc_intel.tables_to_csv(t))
+        return Response(content="\n\n".join(csv_parts), media_type="text/csv")
+    return {"tables": tables, "count": len(tables)}
+
+
+@app.get("/api/pdf/{doc_id}/structure")
+async def get_structure(doc_id: str):
+    """Returns document outline/structure: headings, sections, TOC."""
+    get_doc_path(doc_id)
+    return doc_intel.analyze_structure(doc_id)
+
+
+@app.get("/api/pdf/{doc_id}/entities")
+async def get_entities(doc_id: str):
+    """Returns extracted entities: people, organizations, dates, amounts, etc."""
+    get_doc_path(doc_id)
+    return doc_intel.extract_key_info(doc_id)
+
+
+@app.post("/api/pdf/{doc_id}/ask")
+async def ask_question(doc_id: str, req: AskQuestionRequest):
+    """Ask a question about the document (standalone, separate from chat)."""
+    get_doc_path(doc_id)
+    return doc_intel.answer_question(doc_id, req.question)
+
+
+@app.get("/api/pdf/{doc_id}/forms")
+async def get_forms(doc_id: str):
+    """Returns detected form fields and their values."""
+    get_doc_path(doc_id)
+    return doc_intel.detect_forms(doc_id)
+
+
+@app.post("/api/pdf/{doc_id}/forms/fill")
+async def fill_form(doc_id: str, req: FillFormFieldRequest):
+    """Fill a form field in the PDF."""
+    get_doc_path(doc_id)
+    result = doc_intel.fill_form_field(doc_id, req.field_name, req.value)
+    if result["status"] == "error":
+        raise HTTPException(status_code=404, detail=result["message"])
+    return result
+
+
+@app.get("/api/pdf/{doc_id}/language")
+async def get_language(doc_id: str):
+    """Detect the document's language."""
+    get_doc_path(doc_id)
+    return doc_intel.detect_language(doc_id)
+
+
+@app.get("/api/pdf/{doc_id}/compare/{page1}/{page2}")
+async def compare_pages(doc_id: str, page1: int, page2: int):
+    """Compare content between two pages."""
+    get_doc_path(doc_id)
+    result = doc_intel.compare_pages(doc_id, page1, page2)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/pdf/{doc_id}/sections/search")
+async def search_sections(doc_id: str, req: AskQuestionRequest):
+    """Find sections relevant to a query."""
+    get_doc_path(doc_id)
+    return {"results": doc_intel.find_similar_sections(doc_id, req.question)}
+
+
 # ─── AI Assist ──────────────────────────────────────────────────────────────
 
 @app.post("/api/pdf/{doc_id}/ai/assist")
 async def ai_assist(doc_id: str, req: AIAssistRequest):
     """AI-powered text operations using the document content."""
+    _check_ai_rate_limit()
     file_path = get_doc_path(doc_id)
     doc = fitz.open(str(file_path))
 
@@ -780,14 +974,24 @@ async def ai_assist(doc_id: str, req: AIAssistRequest):
 # ─── Chat Interface ────────────────────────────────────────────────────────
 
 import re as _re
+from backend.ai_engine import understand_and_execute as _ai_understand_and_execute
 
 # In-memory chat histories per document session
 _chat_histories: dict[str, list[dict]] = {}
 
 
+class RegionSelection(BaseModel):
+    page: int
+    x: float
+    y: float
+    width: float
+    height: float
+
 class ChatMessage(BaseModel):
     message: str
     current_page: int = 0
+    stream: bool = False
+    region: RegionSelection | None = None
 
 
 def _get_full_text(doc_id: str) -> dict[int, str]:
@@ -916,6 +1120,11 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
     action = intent["action"]
     file_path = get_doc_path(doc_id)
 
+    # Snapshot before any mutating chat action
+    _mutating_actions = {"replace", "delete_text", "delete_pages", "rotate_page", "redact", "add_text"}
+    if action in _mutating_actions:
+        snapshot(doc_id, f"Chat: {action}")
+
     if action == "query_pages":
         doc = fitz.open(str(file_path))
         count = len(doc)
@@ -945,49 +1154,7 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
         find_str = intent["find"]
         repl_str = intent["replace"]
         scope = intent.get("scope", "all")
-        doc = fitz.open(str(file_path))
-        replaced = 0
-        page_hits = []
-
-        pages_to_scan = [scope] if isinstance(scope, int) else range(len(doc))
-        for p in pages_to_scan:
-            if p < 0 or p >= len(doc):
-                continue
-            page = doc[p]
-            matches = page.search_for(find_str)
-            if not matches:
-                continue
-            # Get font info from first match
-            font_size = 11
-            text_color = (0, 0, 0)
-            blocks = page.get_text("dict")["blocks"]
-            for block in blocks:
-                if block["type"] == 0:
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            span_rect = fitz.Rect(span["bbox"])
-                            if span_rect.intersects(matches[0]):
-                                font_size = span["size"]
-                                text_color = hex_color_to_rgb(span["color"])
-                                break
-
-            for rect in matches:
-                page.add_redact_annot(rect)
-            page.apply_redactions()
-
-            font = fitz.Font("helv")
-            tw = fitz.TextWriter(page.rect)
-            for rect in matches:
-                tw.append(fitz.Point(rect.x0, rect.y0 + font_size),
-                          repl_str, font=font, fontsize=font_size)
-                replaced += 1
-            tw.write_text(page, color=text_color)
-            page_hits.append(p + 1)
-
-        out_path = str(file_path) + ".tmp"
-        doc.save(out_path)
-        doc.close()
-        os.replace(out_path, str(file_path))
+        replaced, page_hits = smart_replace_in_doc(file_path, find_str, repl_str, scope)
 
         if replaced == 0:
             return {"response": f'I couldn\'t find "{find_str}" in the document. No changes made.', "changed": False}
@@ -1006,14 +1173,17 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
             matches = page.search_for(find_str)
             if matches:
                 for rect in matches:
-                    page.add_redact_annot(rect)
-                page.apply_redactions()
+                    page.add_redact_annot(rect, fill=(1, 1, 1))
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                 deleted += len(matches)
                 page_hits.append(i + 1)
-        out_path = str(file_path) + ".tmp"
-        doc.save(out_path)
-        doc.close()
-        os.replace(out_path, str(file_path))
+        if deleted > 0:
+            out_path = str(file_path) + ".tmp"
+            doc.save(out_path)
+            doc.close()
+            os.replace(out_path, str(file_path))
+        else:
+            doc.close()
 
         if deleted == 0:
             return {"response": f'I couldn\'t find "{find_str}" in the document.', "changed": False}
@@ -1114,12 +1284,15 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
                 for rect in matches:
                     page.add_redact_annot(rect, fill=(0, 0, 0))
                     redacted += 1
-            page.apply_redactions()
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-        out_path = str(file_path) + ".tmp"
-        doc.save(out_path)
-        doc.close()
-        os.replace(out_path, str(file_path))
+        if redacted > 0:
+            out_path = str(file_path) + ".tmp"
+            doc.save(out_path)
+            doc.close()
+            os.replace(out_path, str(file_path))
+        else:
+            doc.close()
 
         if redacted == 0:
             return {"response": f"No {pattern} patterns found to redact.", "changed": False}
@@ -1167,6 +1340,18 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
             "changed": False,
         }
 
+    elif action == "query_region":
+        text = intent.get("text", "")
+        if text:
+            return {
+                "response": f"The selected region contains the following text:\n\n\"{text}\"",
+                "changed": False,
+            }
+        return {
+            "response": "The selected region doesn't appear to contain any extractable text. It may contain images or graphics.",
+            "changed": False,
+        }
+
     elif action == "unknown":
         return {
             "response": (
@@ -1191,36 +1376,145 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
 @app.post("/api/pdf/{doc_id}/chat")
 async def chat(doc_id: str, msg: ChatMessage):
     """Process a natural language chat message and execute PDF commands."""
+    _check_ai_rate_limit()
     file_path = get_doc_path(doc_id)
     doc = fitz.open(str(file_path))
     page_count = len(doc)
     current_text = doc[msg.current_page].get_text() if msg.current_page < len(doc) else ""
+
+    # Extract text from selected region if provided
+    region_text = ""
+    if msg.region and msg.region.page < len(doc):
+        region_page = doc[msg.region.page]
+        clip_rect = fitz.Rect(
+            msg.region.x,
+            msg.region.y,
+            msg.region.x + msg.region.width,
+            msg.region.y + msg.region.height,
+        )
+        region_text = region_page.get_text("text", clip=clip_rect).strip()
     doc.close()
 
-    # Parse intent
-    intent = _parse_intent(msg.message, current_text, page_count, msg.current_page)
+    # Build the effective message with region context
+    effective_message = msg.message
+    if msg.region:
+        region_ctx = (
+            f"[Region selected on page {msg.region.page + 1}: "
+            f"x={msg.region.x:.0f}, y={msg.region.y:.0f}, "
+            f"w={msg.region.width:.0f}, h={msg.region.height:.0f}]"
+        )
+        if region_text:
+            region_ctx += f'\n[Text in selected region: """{region_text}"""]'
+        else:
+            region_ctx += "\n[No text found in selected region — it may contain images or graphics]"
+        effective_message = f"{region_ctx}\n\nUser instruction: {msg.message}"
 
-    # Execute
-    result = _execute_intent(doc_id, intent, msg.current_page)
-
-    # Store in chat history
+    # Initialize chat history for this document
     if doc_id not in _chat_histories:
         _chat_histories[doc_id] = []
+
+    # Try AI engine first (Claude API), fall back to regex parser if unavailable
+    ai_result = await _ai_understand_and_execute(
+        message=effective_message,
+        doc_id=doc_id,
+        current_page=msg.region.page if msg.region else msg.current_page,
+        page_text=current_text,
+        page_count=page_count,
+        chat_history=_chat_histories[doc_id],
+    )
+
+    intent = ai_result.get("intent", {})
+    use_fallback = intent.get("reason") in ("no_api_key", "missing_sdk")
+
+    if use_fallback:
+        # Fall back to regex-based intent parser
+        target_page = msg.region.page if msg.region else msg.current_page
+        intent = _parse_intent(msg.message, current_text, page_count, target_page)
+        # Inject region context into replace/delete/redact intents
+        if msg.region and region_text:
+            if intent.get("action") == "replace" and not intent.get("find"):
+                intent["find"] = region_text
+            elif intent.get("action") == "delete_text" and not intent.get("find"):
+                intent["find"] = region_text
+            elif intent.get("action") == "redact" and not intent.get("pattern"):
+                intent["find"] = region_text
+                intent["action"] = "delete_text"
+            elif intent.get("action") in ("query", "unknown") and region_text:
+                intent = {"action": "query_region", "text": region_text}
+        result = _execute_intent(doc_id, intent, target_page)
+        response_text = result["response"]
+        changed = result.get("changed", False)
+        page_count_changed = result.get("page_count_changed", False)
+    else:
+        response_text = ai_result["response"]
+        changed = ai_result.get("changed", False)
+        page_count_changed = ai_result.get("page_count_changed", False)
+
+    # Store in chat history
     _chat_histories[doc_id].append({"role": "user", "content": msg.message})
-    _chat_histories[doc_id].append({"role": "assistant", "content": result["response"], "intent": intent})
+    _chat_histories[doc_id].append({"role": "assistant", "content": response_text, "intent": intent})
 
     # Get updated page count if pages changed
     new_page_count = None
-    if result.get("page_count_changed"):
+    if page_count_changed:
         doc = fitz.open(str(file_path))
         new_page_count = len(doc)
         doc.close()
 
-    return {
-        "response": result["response"],
-        "changed": result.get("changed", False),
+    result_data = {
+        "response": response_text,
+        "changed": changed,
         "intent": intent,
         "new_page_count": new_page_count,
+    }
+
+    # SSE streaming response — sends the response token-by-token for a
+    # real-time typing effect, then sends a final [DONE] event with metadata.
+    if msg.stream:
+        async def generate_sse():
+            # Stream the response text in small chunks to simulate token-by-token
+            chunk_size = 4  # characters per token
+            for i in range(0, len(response_text), chunk_size):
+                token = response_text[i:i + chunk_size]
+                yield f"data: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0.02)  # 20ms between tokens for smooth effect
+            # Send final event with full metadata
+            yield f"data: {json.dumps({'done': True, 'full_response': response_text, 'changed': changed, 'intent': intent, 'new_page_count': new_page_count})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            generate_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    return result_data
+
+
+@app.post("/api/pdf/{doc_id}/ai/configure")
+async def configure_ai(doc_id: str, body: dict = Body(...)):
+    """Set or update the Anthropic API key at runtime."""
+    get_doc_path(doc_id)  # validate doc exists
+    api_key = body.get("api_key", "")
+    if api_key:
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+        return {"status": "ok", "message": "API key configured. AI chat is now active."}
+    return {"status": "error", "message": "No api_key provided."}
+
+
+@app.get("/api/ai/status")
+async def ai_status():
+    """Check if AI engine is available (SDK installed + API key set)."""
+    from backend.ai_engine import HAS_ANTHROPIC
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+    return {
+        "sdk_installed": HAS_ANTHROPIC,
+        "api_key_set": has_key,
+        "ai_available": HAS_ANTHROPIC and has_key,
     }
 
 
@@ -1232,6 +1526,7 @@ async def get_chat_history(doc_id: str):
 
 @app.delete("/api/pdf/{doc_id}")
 async def delete_document(doc_id: str):
+    _validate_doc_id(doc_id)
     doc_dir = UPLOAD_DIR / doc_id
     if doc_dir.exists():
         shutil.rmtree(doc_dir)

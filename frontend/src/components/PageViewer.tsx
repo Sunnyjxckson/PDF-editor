@@ -10,12 +10,23 @@ import {
   addHighlight,
   addDrawing,
   moveResizeContent,
+  getPdfFileUrl,
   type TextBlock,
 } from "@/lib/api";
-import { Loader2 } from "lucide-react";
+import {
+  loadPdfDocument,
+  renderPage,
+  preRenderAdjacentPages,
+  getCachedTextBlocks,
+  setCachedTextBlocks,
+  invalidateTextBlockCache,
+  getCurrentPdfDoc,
+} from "@/lib/pdf-renderer";
+import { Loader2, Monitor, FileImage } from "lucide-react";
 
 const RENDER_DPI = 150;
 const PDF_SCALE = RENDER_DPI / 72;
+const PDFJS_SCALE = 2; // Scale factor for pdf.js rendering (higher = sharper)
 
 interface ContentBlock {
   id: string;
@@ -34,11 +45,15 @@ export default function PageViewer() {
     docId, currentPage, zoom, pageVersion, activeTool,
     drawColor, drawWidth, highlightColor, fontSize,
     setZoom, setCurrentPage, totalPages, bumpVersion,
-    document: docInfo,
+    document: docInfo, renderMode, pdfVersion,
+    addOptimisticEdit, resolveOptimisticEdit, revertOptimisticEdit,
+    optimisticEdits, addToast,
+    regionSelection, setRegionSelection, setChatOpen,
   } = useEditorStore();
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const [loading, setLoading] = useState(true);
   const [imgSrc, setImgSrc] = useState("");
@@ -66,16 +81,86 @@ export default function PageViewer() {
   const [selectedBlock, setSelectedBlock] = useState<ContentBlock | null>(null);
   const [dragMode, setDragMode] = useState<DragMode>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
-  const [dragRect, setDragRect] = useState<number[] | null>(null); // [x0, y0, x1, y1] in screen px
+  const [dragRect, setDragRect] = useState<number[] | null>(null);
   const [originalRect, setOriginalRect] = useState<number[] | null>(null);
+
+  // Region select
+  const [regionStart, setRegionStart] = useState<{ x: number; y: number } | null>(null);
+  const [regionDragRect, setRegionDragRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
   // Touch
   const [pinchStart, setPinchStart] = useState<number | null>(null);
   const [swipeStartX, setSwipeStartX] = useState<number | null>(null);
 
-  // Load page image
+  // Optimistic text edits shown as overlays
+  const [optimisticTextOverlays, setOptimisticTextOverlays] = useState<
+    { id: string; bbox: number[]; text: string; fontSize: number }[]
+  >([]);
+
+  // ─── Fetch text blocks with cache ───────────────────────────────────
+  const fetchTextBlocksCached = useCallback(
+    async (page: number): Promise<TextBlock[]> => {
+      if (!docId) return [];
+      const cached = getCachedTextBlocks(docId, page, pageVersion);
+      if (cached) return cached;
+      const result = await getTextBlocks(docId, page);
+      if (result.length > 0) {
+        setCachedTextBlocks(docId, page, pageVersion, result[0].blocks);
+        return result[0].blocks;
+      }
+      return [];
+    },
+    [docId, pageVersion],
+  );
+
+  // ─── PDF.js Rendering ───────────────────────────────────────────────
   useEffect(() => {
-    if (!docId) return;
+    if (!docId || renderMode !== "pdfjs") return;
+    let cancelled = false;
+
+    const renderWithPdfJs = async () => {
+      setLoading(true);
+      try {
+        const pdfUrl = getPdfFileUrl(docId);
+        const doc = await loadPdfDocument(pdfUrl, docId, pdfVersion);
+        if (cancelled) return;
+
+        const canvas = pdfCanvasRef.current;
+        if (!canvas) return;
+
+        const { width, height } = await renderPage(doc, currentPage, PDFJS_SCALE, canvas);
+        if (cancelled) return;
+
+        setImgSize({ w: width, h: height });
+        setLoading(false);
+
+        // Pre-render adjacent pages in background
+        preRenderAdjacentPages(doc, currentPage, PDFJS_SCALE, docId, pdfVersion);
+      } catch (err) {
+        if (!cancelled) {
+          console.error("PDF.js render failed:", err);
+          setLoading(false);
+        }
+      }
+    };
+
+    renderWithPdfJs();
+    setAllPaths([]);
+    setEditingBlock(null);
+    setAddingText(null);
+    setHighlightRect(null);
+    setShowTextBlocks(false);
+    setSelectedBlock(null);
+    setDragRect(null);
+    setRegionStart(null);
+    setRegionDragRect(null);
+
+    return () => { cancelled = true; };
+  }, [docId, currentPage, pdfVersion, renderMode]);
+
+  // ─── Image-based Rendering (existing) ───────────────────────────────
+  useEffect(() => {
+    if (!docId || renderMode !== "image") return;
     setLoading(true);
     setImgSrc(`${getPageUrl(docId, currentPage, RENDER_DPI)}&v=${pageVersion}`);
     setAllPaths([]);
@@ -85,22 +170,21 @@ export default function PageViewer() {
     setShowTextBlocks(false);
     setSelectedBlock(null);
     setDragRect(null);
-  }, [docId, currentPage, pageVersion]);
+    setRegionStart(null);
+    setRegionDragRect(null);
+  }, [docId, currentPage, pageVersion, renderMode]);
 
-  // Load text blocks for text tool
+  // ─── Load text blocks for text tool (with cache) ────────────────────
   useEffect(() => {
     if (!docId || activeTool !== "text") { setShowTextBlocks(false); return; }
     setShowTextBlocks(true);
-    getTextBlocks(docId, currentPage).then((r) => { if (r.length > 0) setTextBlocks(r[0].blocks); });
-  }, [docId, currentPage, activeTool, pageVersion]);
+    fetchTextBlocksCached(currentPage).then(setTextBlocks);
+  }, [docId, currentPage, activeTool, pageVersion, fetchTextBlocksCached]);
 
-  // Load content blocks for select tool
+  // ─── Load content blocks for select tool (with cache) ───────────────
   useEffect(() => {
     if (!docId || activeTool !== "select") { setContentBlocks([]); setSelectedBlock(null); return; }
-    getTextBlocks(docId, currentPage).then((r) => {
-      if (r.length === 0) return;
-      // Group spans into logical blocks by proximity
-      const spans = r[0].blocks;
+    fetchTextBlocksCached(currentPage).then((spans) => {
       const blocks: ContentBlock[] = [];
       const grouped = new Set<number>();
 
@@ -108,12 +192,11 @@ export default function PageViewer() {
         if (grouped.has(i)) continue;
         const group = [spans[i]];
         grouped.add(i);
-        const [x0, y0, x1, y1] = spans[i].bbox;
+        const [x0, y0, x1] = spans[i].bbox;
 
-        // Group nearby spans on the same line
         for (let j = i + 1; j < spans.length; j++) {
           if (grouped.has(j)) continue;
-          const [bx0, by0, bx1, by1] = spans[j].bbox;
+          const [bx0, by0] = spans[j].bbox;
           if (Math.abs(by0 - y0) < spans[i].size * 0.5 && bx0 - x1 < spans[i].size * 2) {
             group.push(spans[j]);
             grouped.add(j);
@@ -125,14 +208,15 @@ export default function PageViewer() {
             Math.min(acc[0], s.bbox[0]), Math.min(acc[1], s.bbox[1]),
             Math.max(acc[2], s.bbox[2]), Math.max(acc[3], s.bbox[3]),
           ],
-          [Infinity, Infinity, -Infinity, -Infinity]
+          [Infinity, Infinity, -Infinity, -Infinity],
         );
 
+        const scale = renderMode === "pdfjs" ? PDFJS_SCALE : PDF_SCALE;
         blocks.push({
           id: `block-${i}`,
           text: group.map((s) => s.text).join(" "),
           bbox: allBbox,
-          screenBbox: allBbox.map((v) => v * PDF_SCALE),
+          screenBbox: allBbox.map((v) => v * scale),
           font: group[0].font,
           size: group[0].size,
           color: group[0].color,
@@ -140,7 +224,7 @@ export default function PageViewer() {
       }
       setContentBlocks(blocks);
     });
-  }, [docId, currentPage, activeTool, pageVersion]);
+  }, [docId, currentPage, activeTool, pageVersion, fetchTextBlocksCached, renderMode]);
 
   const handleImageLoad = useCallback(() => {
     setLoading(false);
@@ -155,7 +239,7 @@ export default function PageViewer() {
     canvas.width = imgSize.w;
     canvas.height = imgSize.h;
     redrawCanvas();
-  }, [imgSize, allPaths, drawPoints, highlightRect]);
+  }, [imgSize, allPaths, drawPoints, highlightRect, regionDragRect]);
 
   const redrawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -200,12 +284,16 @@ export default function PageViewer() {
     return { x: (touch.clientX - rect.left) * (canvas.width / rect.width), y: (touch.clientY - rect.top) * (canvas.height / rect.height) };
   };
 
+  // ─── Current scale factor based on render mode ──────────────────────
+  const currentScale = renderMode === "pdfjs" ? PDFJS_SCALE : PDF_SCALE;
+
   // ─── Mouse Handlers (draw/highlight/eraser) ──────────────────────────
 
   const handleCanvasMouseDown = (e: React.MouseEvent) => {
     const pos = getCanvasPos(e);
     if (activeTool === "draw") { setIsDrawing(true); setDrawPoints([[pos.x, pos.y]]); }
     else if (activeTool === "highlight") { setHighlightStart(pos); setHighlightRect({ x: pos.x, y: pos.y, w: 0, h: 0 }); }
+    else if (activeTool === "region_select") { setRegionStart(pos); setRegionDragRect({ x: pos.x, y: pos.y, w: 0, h: 0 }); setRegionSelection(null); }
     else if (activeTool === "eraser") {
       const threshold = 20;
       const idx = allPaths.findLastIndex((path) => path.points.some((p) => Math.abs(p[0] - pos.x) < threshold && Math.abs(p[1] - pos.y) < threshold));
@@ -221,6 +309,11 @@ export default function PageViewer() {
         x: Math.min(highlightStart.x, pos.x), y: Math.min(highlightStart.y, pos.y),
         w: Math.abs(pos.x - highlightStart.x), h: Math.abs(pos.y - highlightStart.y),
       });
+    } else if (activeTool === "region_select" && regionStart) {
+      setRegionDragRect({
+        x: Math.min(regionStart.x, pos.x), y: Math.min(regionStart.y, pos.y),
+        w: Math.abs(pos.x - regionStart.x), h: Math.abs(pos.y - regionStart.y),
+      });
     }
   };
 
@@ -230,21 +323,40 @@ export default function PageViewer() {
       setAllPaths((prev) => [...prev, newPath]);
       setDrawPoints([]); setIsDrawing(false);
       if (docId) {
-        const pdfPoints = newPath.points.map((p) => [p[0] / PDF_SCALE, p[1] / PDF_SCALE]);
+        const pdfPoints = newPath.points.map((p) => [p[0] / currentScale, p[1] / currentScale]);
         const hexToRgb = (hex: string) => [parseInt(hex.slice(1, 3), 16) / 255, parseInt(hex.slice(3, 5), 16) / 255, parseInt(hex.slice(5, 7), 16) / 255];
-        await addDrawing(docId, currentPage, [{ points: pdfPoints, color: hexToRgb(newPath.color), width: newPath.width / PDF_SCALE }]);
+        await addDrawing(docId, currentPage, [{ points: pdfPoints, color: hexToRgb(newPath.color), width: newPath.width / currentScale }]);
+        invalidateTextBlockCache(docId, currentPage);
         bumpVersion();
       }
     } else if (activeTool === "highlight" && highlightRect && highlightRect.w > 5 && highlightRect.h > 5) {
       if (docId) {
-        const pdfRect = [highlightRect.x / PDF_SCALE, highlightRect.y / PDF_SCALE, (highlightRect.x + highlightRect.w) / PDF_SCALE, (highlightRect.y + highlightRect.h) / PDF_SCALE];
+        const pdfRect = [highlightRect.x / currentScale, highlightRect.y / currentScale, (highlightRect.x + highlightRect.w) / currentScale, (highlightRect.y + highlightRect.h) / currentScale];
         const hexToRgb = (hex: string) => [parseInt(hex.slice(1, 3), 16) / 255, parseInt(hex.slice(3, 5), 16) / 255, parseInt(hex.slice(5, 7), 16) / 255];
         await addHighlight(docId, currentPage, [pdfRect], hexToRgb(highlightColor));
         bumpVersion();
       }
       setHighlightRect(null); setHighlightStart(null);
+    } else if (activeTool === "region_select" && regionDragRect && regionDragRect.w > 5 && regionDragRect.h > 5) {
+      // Convert screen coords to PDF coords
+      const pdfRect = {
+        x: regionDragRect.x / currentScale,
+        y: regionDragRect.y / currentScale,
+        width: regionDragRect.w / currentScale,
+        height: regionDragRect.h / currentScale,
+      };
+      setRegionSelection({
+        page: currentPage,
+        rect: pdfRect,
+        screenRect: { x: regionDragRect.x, y: regionDragRect.y, width: regionDragRect.w, height: regionDragRect.h },
+      });
+      setRegionDragRect(null);
+      setRegionStart(null);
+      // Auto-open chat panel
+      setChatOpen(true);
     } else {
       setIsDrawing(false); setDrawPoints([]); setHighlightStart(null); setHighlightRect(null);
+      setRegionStart(null); setRegionDragRect(null);
     }
   };
 
@@ -252,20 +364,24 @@ export default function PageViewer() {
 
   const getHandleAtPos = (x: number, y: number, rect: number[]): DragMode => {
     const [x0, y0, x1, y1] = rect;
-    const hs = 8; // handle size in screen px
-    // Corners
+    const hs = 8;
     if (Math.abs(x - x0) < hs && Math.abs(y - y0) < hs) return "nw";
     if (Math.abs(x - x1) < hs && Math.abs(y - y0) < hs) return "ne";
     if (Math.abs(x - x0) < hs && Math.abs(y - y1) < hs) return "sw";
     if (Math.abs(x - x1) < hs && Math.abs(y - y1) < hs) return "se";
-    // Edges
     if (Math.abs(y - y0) < hs && x > x0 && x < x1) return "n";
     if (Math.abs(y - y1) < hs && x > x0 && x < x1) return "s";
     if (Math.abs(x - x0) < hs && y > y0 && y < y1) return "w";
     if (Math.abs(x - x1) < hs && y > y0 && y < y1) return "e";
-    // Inside = move
     if (x >= x0 && x <= x1 && y >= y0 && y <= y1) return "move";
     return null;
+  };
+
+  const getWrapperPos = (e: React.MouseEvent | MouseEvent) => {
+    const wrapper = renderMode === "pdfjs" ? pdfCanvasRef.current?.parentElement : imgRef.current?.parentElement;
+    if (!wrapper) return { x: 0, y: 0 };
+    const wrapperRect = wrapper.getBoundingClientRect();
+    return { x: (e.clientX - wrapperRect.left) / zoom, y: (e.clientY - wrapperRect.top) / zoom };
   };
 
   const handleSelectMouseDown = (e: React.MouseEvent, block: ContentBlock) => {
@@ -276,30 +392,23 @@ export default function PageViewer() {
     setDragRect([...r]);
     setOriginalRect([...block.screenBbox]);
 
-    const wrapper = imgRef.current?.parentElement;
-    if (!wrapper) return;
-    const wrapperRect = wrapper.getBoundingClientRect();
-    const x = (e.clientX - wrapperRect.left) / zoom;
-    const y = (e.clientY - wrapperRect.top) / zoom;
-
-    const mode = getHandleAtPos(x, y, r);
+    const pos = getWrapperPos(e);
+    const mode = getHandleAtPos(pos.x, pos.y, r);
     setDragMode(mode);
-    setDragStart({ x, y });
+    setDragStart(pos);
   };
 
   const handleSelectGlobalMouseDown = (e: React.MouseEvent) => {
-    // Click on empty area = deselect
     if (activeTool === "select" && selectedBlock) {
-      const wrapper = imgRef.current?.parentElement;
-      if (!wrapper) return;
-      const wrapperRect = wrapper.getBoundingClientRect();
-      const x = (e.clientX - wrapperRect.left) / zoom;
-      const y = (e.clientY - wrapperRect.top) / zoom;
-      // Check if click is on the selected block
+      const pos = getWrapperPos(e);
       const r = dragRect || selectedBlock.screenBbox;
-      if (x < r[0] || x > r[2] || y < r[1] || y > r[3]) {
+      if (pos.x < r[0] || pos.x > r[2] || pos.y < r[1] || pos.y > r[3]) {
         commitMoveResize();
       }
+    }
+    // Clear finalized region selection when clicking outside of it (except when dragging a new one)
+    if (activeTool !== "region_select" && regionSelection) {
+      setRegionSelection(null);
     }
   };
 
@@ -307,13 +416,9 @@ export default function PageViewer() {
     if (!dragMode || !dragStart || !dragRect) return;
 
     const handleMouseMove = (e: MouseEvent) => {
-      const wrapper = imgRef.current?.parentElement;
-      if (!wrapper) return;
-      const wrapperRect = wrapper.getBoundingClientRect();
-      const x = (e.clientX - wrapperRect.left) / zoom;
-      const y = (e.clientY - wrapperRect.top) / zoom;
-      const dx = x - dragStart.x;
-      const dy = y - dragStart.y;
+      const pos = getWrapperPos(e);
+      const dx = pos.x - dragStart.x;
+      const dy = pos.y - dragStart.y;
       const orig = originalRect || dragRect;
 
       setDragRect((prev) => {
@@ -325,13 +430,11 @@ export default function PageViewer() {
           r[0] = orig[0] + dx; r[1] = orig[1] + dy;
           r[2] = r[0] + w; r[3] = r[1] + h;
         } else {
-          // Reset to original + delta for resize
           r[0] = orig[0]; r[1] = orig[1]; r[2] = orig[2]; r[3] = orig[3];
           if (dragMode.includes("n")) r[1] = orig[1] + dy;
           if (dragMode.includes("s")) r[3] = orig[3] + dy;
           if (dragMode.includes("w")) r[0] = orig[0] + dx;
           if (dragMode.includes("e")) r[2] = orig[2] + dx;
-          // Enforce minimum size
           if (r[2] - r[0] < 20) r[2] = r[0] + 20;
           if (r[3] - r[1] < 10) r[3] = r[1] + 10;
         }
@@ -351,7 +454,7 @@ export default function PageViewer() {
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
     };
-  }, [dragMode, dragStart, dragRect, originalRect, zoom]);
+  }, [dragMode, dragStart, dragRect, originalRect, zoom, renderMode]);
 
   const commitMoveResize = async () => {
     if (!docId || !selectedBlock || !dragRect) {
@@ -360,7 +463,6 @@ export default function PageViewer() {
     }
     const orig = selectedBlock.screenBbox;
     const moved = dragRect;
-    // Check if actually moved/resized
     const hasMoved = orig.some((v, i) => Math.abs(v - moved[i]) > 2);
     if (!hasMoved) {
       setSelectedBlock(null); setDragRect(null);
@@ -369,26 +471,83 @@ export default function PageViewer() {
     await moveResizeContent(docId, {
       page: currentPage,
       old_bbox: selectedBlock.bbox,
-      new_bbox: moved.map((v) => v / PDF_SCALE),
+      new_bbox: moved.map((v) => v / currentScale),
     });
     setSelectedBlock(null);
     setDragRect(null);
+    invalidateTextBlockCache(docId, currentPage);
     bumpVersion();
   };
 
-  // ─── Text Edit ───────────────────────────────────────────────────────
+  // ─── Text Edit (with optimistic updates) ────────────────────────────
 
   const commitTextEdit = async () => {
     if (!docId || !editingBlock) return;
     if (editText_ === editingBlock.text) { setEditingBlock(null); return; }
-    await editText(docId, { page: currentPage, bbox: editingBlock.bbox, new_text: editText_, font_size: editingBlock.size });
-    setEditingBlock(null); bumpVersion();
+
+    const editId = `opt-${Date.now()}`;
+    const bbox = editingBlock.bbox;
+
+    // Optimistic: show the new text immediately as an overlay
+    addOptimisticEdit({
+      id: editId,
+      page: currentPage,
+      type: "text-edit",
+      preview: { bbox, text: editText_, fontSize: editingBlock.size },
+      pending: true,
+    });
+    setOptimisticTextOverlays((prev) => [
+      ...prev,
+      { id: editId, bbox, text: editText_, fontSize: editingBlock.size },
+    ]);
+    setEditingBlock(null);
+
+    try {
+      await editText(docId, { page: currentPage, bbox, new_text: editText_, font_size: editingBlock.size });
+      resolveOptimisticEdit(editId);
+      invalidateTextBlockCache(docId, currentPage);
+      bumpVersion();
+    } catch {
+      revertOptimisticEdit(editId);
+      addToast("Text edit failed — reverted", "error");
+    }
+    // Remove overlay after version bump triggers re-render
+    setOptimisticTextOverlays((prev) => prev.filter((o) => o.id !== editId));
   };
 
   const commitNewText = async () => {
     if (!docId || !addingText || !newText.trim()) { setAddingText(null); return; }
-    await addText(docId, { page: currentPage, x: addingText.x / PDF_SCALE, y: addingText.y / PDF_SCALE, text: newText, font_size: fontSize });
-    setAddingText(null); setNewText(""); bumpVersion();
+
+    const editId = `opt-${Date.now()}`;
+    const pdfX = addingText.x / currentScale;
+    const pdfY = addingText.y / currentScale;
+
+    // Optimistic: show the text immediately
+    addOptimisticEdit({
+      id: editId,
+      page: currentPage,
+      type: "text-add",
+      preview: { x: addingText.x, y: addingText.y, text: newText, fontSize },
+      pending: true,
+    });
+    setOptimisticTextOverlays((prev) => [
+      ...prev,
+      { id: editId, bbox: [pdfX, pdfY, pdfX + 100, pdfY + fontSize], text: newText, fontSize },
+    ]);
+    setAddingText(null);
+    const savedText = newText;
+    setNewText("");
+
+    try {
+      await addText(docId, { page: currentPage, x: pdfX, y: pdfY, text: savedText, font_size: fontSize });
+      resolveOptimisticEdit(editId);
+      invalidateTextBlockCache(docId, currentPage);
+      bumpVersion();
+    } catch {
+      revertOptimisticEdit(editId);
+      addToast("Failed to add text — reverted", "error");
+    }
+    setOptimisticTextOverlays((prev) => prev.filter((o) => o.id !== editId));
   };
 
   // ─── Touch ───────────────────────────────────────────────────────────
@@ -434,7 +593,7 @@ export default function PageViewer() {
     if (dragMode === "n" || dragMode === "s") return "ns-resize";
     if (dragMode === "e" || dragMode === "w") return "ew-resize";
     switch (activeTool) {
-      case "draw": case "highlight": return "crosshair";
+      case "draw": case "highlight": case "region_select": return "crosshair";
       case "text": return "text";
       case "eraser": return "pointer";
       case "select": return "default";
@@ -454,6 +613,34 @@ export default function PageViewer() {
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
+      {/* Render mode toggle */}
+      <div className="fixed bottom-4 left-4 z-20 flex gap-1 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-1">
+        <button
+          onClick={() => useEditorStore.getState().setRenderMode("image")}
+          className={`p-1.5 rounded-md text-xs flex items-center gap-1 transition-colors ${
+            renderMode === "image"
+              ? "bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300"
+              : "text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700"
+          }`}
+          title="Image rendering (server-side)"
+        >
+          <FileImage className="w-3.5 h-3.5" />
+          <span className="hidden sm:inline">Image</span>
+        </button>
+        <button
+          onClick={() => useEditorStore.getState().setRenderMode("pdfjs")}
+          className={`p-1.5 rounded-md text-xs flex items-center gap-1 transition-colors ${
+            renderMode === "pdfjs"
+              ? "bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300"
+              : "text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700"
+          }`}
+          title="PDF.js rendering (client-side)"
+        >
+          <Monitor className="w-3.5 h-3.5" />
+          <span className="hidden sm:inline">PDF.js</span>
+        </button>
+      </div>
+
       <div
         className="relative shadow-xl rounded-sm bg-white"
         style={{ transform: `scale(${zoom})`, transformOrigin: "top center", cursor: getCursor() }}
@@ -465,17 +652,80 @@ export default function PageViewer() {
           </div>
         )}
 
-        {imgSrc && (
+        {/* Image-based rendering */}
+        {renderMode === "image" && imgSrc && (
           <img ref={imgRef} src={imgSrc} alt={`Page ${currentPage + 1}`} className="max-w-none select-none block"
             onLoad={handleImageLoad} draggable={false} style={{ display: loading ? "none" : "block" }} />
+        )}
+
+        {/* PDF.js canvas rendering */}
+        {renderMode === "pdfjs" && (
+          <canvas
+            ref={pdfCanvasRef}
+            className="max-w-none select-none block"
+            style={{ display: loading ? "none" : "block" }}
+          />
         )}
 
         {/* Drawing/Highlight Canvas */}
         {!loading && imgSize.w > 0 && (
           <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full"
-            style={{ pointerEvents: (activeTool === "draw" || activeTool === "highlight" || activeTool === "eraser") ? "auto" : "none" }}
+            style={{ pointerEvents: (activeTool === "draw" || activeTool === "highlight" || activeTool === "eraser" || activeTool === "region_select") ? "auto" : "none" }}
             onMouseDown={handleCanvasMouseDown} onMouseMove={handleCanvasMouseMove}
             onMouseUp={handleCanvasMouseUp} onMouseLeave={handleCanvasMouseUp} />
+        )}
+
+        {/* Optimistic text overlays */}
+        {optimisticTextOverlays
+          .filter((o) => optimisticEdits.some((e) => e.id === o.id))
+          .map((overlay) => {
+            const [x0, y0, x1, y1] = overlay.bbox.map((v) => v * currentScale);
+            return (
+              <div
+                key={overlay.id}
+                className="absolute bg-yellow-100/80 dark:bg-yellow-900/40 border border-yellow-400 px-1 pointer-events-none"
+                style={{
+                  left: x0, top: y0,
+                  minWidth: x1 - x0, minHeight: y1 - y0,
+                  fontSize: Math.max(10, overlay.fontSize * 0.8),
+                  lineHeight: 1.2,
+                }}
+              >
+                {overlay.text}
+              </div>
+            );
+          })}
+
+        {/* Region select: dragging preview */}
+        {activeTool === "region_select" && regionDragRect && regionDragRect.w > 0 && (
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              left: regionDragRect.x,
+              top: regionDragRect.y,
+              width: regionDragRect.w,
+              height: regionDragRect.h,
+              border: "2px dashed rgb(59, 130, 246)",
+              backgroundColor: "rgba(59, 130, 246, 0.1)",
+              zIndex: 25,
+            }}
+          />
+        )}
+
+        {/* Region select: finalized selection */}
+        {regionSelection && regionSelection.page === currentPage && (
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              left: regionSelection.screenRect.x,
+              top: regionSelection.screenRect.y,
+              width: regionSelection.screenRect.width,
+              height: regionSelection.screenRect.height,
+              border: "2px dashed rgb(59, 130, 246)",
+              backgroundColor: "rgba(59, 130, 246, 0.08)",
+              zIndex: 25,
+            }}
+          />
         )}
 
         {/* Select mode: content block overlays */}
@@ -484,7 +734,6 @@ export default function PageViewer() {
           const r = isSelected && dragRect ? dragRect : block.screenBbox;
           return (
             <div key={block.id}>
-              {/* Block outline */}
               <div
                 className={`absolute transition-shadow ${
                   isSelected
@@ -499,7 +748,6 @@ export default function PageViewer() {
                 onMouseDown={(e) => handleSelectMouseDown(e, block)}
               />
 
-              {/* Resize handles (when selected) */}
               {isSelected && (
                 <>
                   {(["nw", "ne", "sw", "se", "n", "s", "e", "w"] as const).map((handle) => {
@@ -521,16 +769,13 @@ export default function PageViewer() {
                           e.stopPropagation();
                           e.preventDefault();
                           setDragMode(handle);
-                          const wrapper = imgRef.current?.parentElement;
-                          if (!wrapper) return;
-                          const wr = wrapper.getBoundingClientRect();
-                          setDragStart({ x: (e.clientX - wr.left) / zoom, y: (e.clientY - wr.top) / zoom });
+                          const pos = getWrapperPos(e);
+                          setDragStart(pos);
                           setOriginalRect(dragRect ? [...dragRect] : [...block.screenBbox]);
                         }}
                       />
                     );
                   })}
-                  {/* Commit button */}
                   <div className="absolute flex gap-1" style={{ left: r[2] + 4, top: r[1] }}>
                     <button
                       onClick={(e) => { e.stopPropagation(); commitMoveResize(); }}
@@ -553,7 +798,7 @@ export default function PageViewer() {
 
         {/* Text block overlays (text tool) */}
         {showTextBlocks && !loading && textBlocks.map((block, i) => {
-          const [x0, y0, x1, y1] = block.bbox.map((v) => v * PDF_SCALE);
+          const [x0, y0, x1, y1] = block.bbox.map((v) => v * currentScale);
           return (
             <div key={i} className="absolute border border-blue-400/50 hover:border-blue-500 hover:bg-blue-500/10 cursor-text transition-colors"
               style={{ left: x0, top: y0, width: x1 - x0, height: y1 - y0 }}
@@ -573,7 +818,7 @@ export default function PageViewer() {
 
         {/* Text editing popup */}
         {editingBlock && (
-          <div className="absolute z-30" style={{ left: editingBlock.bbox[0] * PDF_SCALE, top: editingBlock.bbox[1] * PDF_SCALE - 4 }}>
+          <div className="absolute z-30" style={{ left: editingBlock.bbox[0] * currentScale, top: editingBlock.bbox[1] * currentScale - 4 }}>
             <div className="bg-white dark:bg-gray-800 border border-blue-500 rounded-lg shadow-xl p-2 min-w-[200px]">
               <textarea autoFocus value={editText_} onChange={(e) => setEditText_(e.target.value)}
                 className="w-full min-h-[60px] p-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-900 dark:text-white resize-y"

@@ -240,6 +240,10 @@ export function getExportUrl(docId: string): string {
   return `${API_BASE}/api/pdf/${docId}/export`;
 }
 
+export function getPdfFileUrl(docId: string): string {
+  return `${API_BASE}/api/pdf/${docId}/export`;
+}
+
 // ─── AI Assist ────────────────────────────────────────────────────────────
 
 export async function aiAssist(docId: string, data: {
@@ -274,6 +278,120 @@ export async function sendChatMessage(docId: string, message: string, currentPag
   });
   if (!res.ok) throw new Error("Chat failed");
   return res.json();
+}
+
+// ─── Streaming Chat (SSE) ────────────────────────────────────────────────────
+
+export interface StreamChatCallbacks {
+  onToken: (token: string) => void;
+  onDone: (data: ChatResponse) => void;
+  onError: (error: Error) => void;
+}
+
+export interface RegionRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export function streamChatMessage(
+  docId: string,
+  message: string,
+  currentPage: number,
+  callbacks: StreamChatCallbacks,
+  region?: { page: number; rect: RegionRect },
+): AbortController {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const body: Record<string, unknown> = { message, current_page: currentPage, stream: true };
+      if (region) {
+        body.region = {
+          page: region.page,
+          x: Math.round(region.rect.x),
+          y: Math.round(region.rect.y),
+          width: Math.round(region.rect.width),
+          height: Math.round(region.rect.height),
+        };
+      }
+      const res = await fetch(`${API_BASE}/api/pdf/${docId}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        // Fall back to non-streaming if server doesn't support it
+        const errorText = await res.text();
+        throw new Error(errorText || "Chat failed");
+      }
+
+      const contentType = res.headers.get("content-type") || "";
+
+      // If the server returned JSON instead of SSE, handle as non-streaming
+      if (contentType.includes("application/json")) {
+        const data: ChatResponse = await res.json();
+        callbacks.onToken(data.response);
+        callbacks.onDone(data);
+        return;
+      }
+
+      // Parse SSE stream
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalData: ChatResponse | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || ""; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6).trim();
+            if (data === "[DONE]") continue;
+
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.token) {
+                callbacks.onToken(parsed.token);
+              }
+              if (parsed.done) {
+                finalData = {
+                  response: parsed.full_response || "",
+                  changed: parsed.changed || false,
+                  intent: parsed.intent || {},
+                  new_page_count: parsed.new_page_count ?? null,
+                };
+              }
+            } catch {
+              // If it's not JSON, treat as a raw token
+              if (data) callbacks.onToken(data);
+            }
+          }
+        }
+      }
+
+      if (finalData) {
+        callbacks.onDone(finalData);
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        callbacks.onError(err as Error);
+      }
+    }
+  })();
+
+  return controller;
 }
 
 export async function getChatHistory(docId: string): Promise<{ role: string; content: string }[]> {

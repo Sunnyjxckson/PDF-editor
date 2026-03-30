@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+__pycache__
+*.pyc
+backend/venv
+backend/__pycache__
+uploads/*
+!uploads/.gitkeep
+.env
+*.log
