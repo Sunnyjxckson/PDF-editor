@@ -13,6 +13,44 @@ export type Tool =
   | "edit_text" | "objects" | "comment" | "sign" | "forms" | "redact";
 export type RenderMode = "image" | "pdfjs";
 
+/**
+ * Zoom is TRUE size: at zoom 1 (100%) one PDF point is 96/72 CSS px, i.e. 72pt =
+ * 1 inch = 96 CSS px, so a US Letter page (612pt) is 816 CSS px wide.
+ * "fit-width" / "fit-page" make the viewer recompute zoom from its own size.
+ */
+export const CSS_PX_PER_PT = 96 / 72;
+export const ZOOM_MIN = 0.25;
+export const ZOOM_MAX = 3;
+export const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+export type ZoomMode = "custom" | "fit-width" | "fit-page";
+
+export const clampZoom = (z: number) => Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+
+/** Next/previous preset step from the current zoom (for Ctrl/Cmd +/-). */
+export function stepZoom(zoom: number, dir: 1 | -1): number {
+  const eps = 0.005;
+  if (dir > 0) return ZOOM_STEPS.find((z) => z > zoom + eps) ?? ZOOM_MAX;
+  return [...ZOOM_STEPS].reverse().find((z) => z < zoom - eps) ?? ZOOM_MIN;
+}
+
+/**
+ * Zoom that fits a page (size in PDF points) into an area (CSS px).
+ * fit-width uses only the width; fit-page fits both dimensions.
+ */
+export function computeFitZoom(
+  mode: Exclude<ZoomMode, "custom">,
+  pageWidthPt: number,
+  pageHeightPt: number,
+  availWidthPx: number,
+  availHeightPx: number,
+): number {
+  if (pageWidthPt <= 0 || pageHeightPt <= 0 || availWidthPx <= 0) return 1;
+  const byW = availWidthPx / (pageWidthPt * CSS_PX_PER_PT);
+  if (mode === "fit-width" || availHeightPx <= 0) return clampZoom(byW);
+  const byH = availHeightPx / (pageHeightPt * CSS_PX_PER_PT);
+  return clampZoom(Math.min(byW, byH));
+}
+
 /** Right-hand side panels. sign/forms/redact are tied to the tool of the same name. */
 export type SidePanel =
   | "sign" | "forms" | "redact" | "comments" | "bookmarks" | "convert" | "protect" | "tools";
@@ -55,6 +93,8 @@ interface EditorState {
   currentPage: number;
   totalPages: number;
   zoom: number;
+  /** custom = fixed zoom; fit-* = PageViewer recomputes zoom on resize / page change */
+  zoomMode: ZoomMode;
   pageVersion: number;
 
   // Rendering
@@ -102,7 +142,13 @@ interface EditorState {
   setDocument: (doc: DocumentInfo, docId: string) => void;
   setFilename: (name: string | null) => void;
   setCurrentPage: (page: number) => void;
+  /** Set an explicit zoom (switches zoomMode to "custom"). */
   setZoom: (zoom: number) => void;
+  setZoomMode: (mode: ZoomMode) => void;
+  /** Used by the viewer to apply a computed fit zoom without leaving fit mode. */
+  applyFitZoom: (zoom: number) => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
   setActiveTool: (tool: Tool) => void;
   setDrawColor: (color: string) => void;
   setDrawWidth: (width: number) => void;
@@ -155,6 +201,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   currentPage: 0,
   totalPages: 0,
   zoom: 1,
+  zoomMode: "custom",
   pageVersion: 0,
 
   renderMode: "image",
@@ -208,7 +255,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     ),
   setFilename: (filename) => set({ filename }),
   setCurrentPage: (page) => set({ currentPage: page }),
-  setZoom: (zoom) => set({ zoom: Math.max(0.25, Math.min(3, zoom)) }),
+  setZoom: (zoom) => set({ zoom: clampZoom(zoom), zoomMode: "custom" }),
+  setZoomMode: (zoomMode) => set({ zoomMode }),
+  applyFitZoom: (zoom) => set((s) => (Math.abs(s.zoom - clampZoom(zoom)) < 1e-4 ? s : { zoom: clampZoom(zoom) })),
+  zoomIn: () => set((s) => ({ zoom: stepZoom(s.zoom, 1), zoomMode: "custom" })),
+  zoomOut: () => set((s) => ({ zoom: stepZoom(s.zoom, -1), zoomMode: "custom" })),
   setActiveTool: (tool) =>
     set((s) => {
       const next: Partial<EditorState> = { activeTool: tool, regionSelection: null };
@@ -299,6 +350,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       currentPage: 0,
       totalPages: 0,
       zoom: 1,
+      zoomMode: "custom",
       activeTool: "select",
       pageVersion: 0,
       pdfVersion: 0,

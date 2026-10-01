@@ -455,14 +455,80 @@ class ResizeRequest(PagesRequest):
     scale_content: bool = True  # False: keep content at 100% and center it
 
 
+def _num_list(s: str) -> list[float]:
+    return [float(v) for v in re.findall(r"[+\-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+\-]?\d+)?", s)]
+
+
+def _fmt_nums(vals) -> str:
+    return " ".join(f"{v:.4f}".rstrip("0").rstrip(".") if v != int(v) else str(int(v)) for v in vals)
+
+
+def _inherited_box(doc: fitz.Document, page: fitz.Page, key: str) -> Optional[list[float]]:
+    xref = page.xref
+    for _ in range(64):
+        t, v = doc.xref_get_key(xref, key)
+        if t == "array":
+            nums = _num_list(v)
+            if len(nums) == 4:
+                return nums
+        t, v = doc.xref_get_key(xref, "Parent")
+        if t != "xref":
+            return None
+        xref = int(v.split()[0])
+    return None
+
+
+def _pdf_to_unrotated_matrix(doc: fitz.Document, page: fitz.Page) -> fitz.Matrix:
+    """PDF user space (annotation /Rect etc.) -> PyMuPDF unrotated page space
+    (top-left origin, relative to the CropBox)."""
+    mb = _inherited_box(doc, page, "MediaBox") or [0, 0, page.mediabox.width, page.mediabox.height]
+    cb = _inherited_box(doc, page, "CropBox") or mb
+    x0 = max(min(cb[0], cb[2]), min(mb[0], mb[2]))
+    y1 = min(max(cb[1], cb[3]), max(mb[1], mb[3]))
+    return fitz.Matrix(1, 0, 0, -1, -x0, y1)
+
+
+def _transform_annot_geometry(doc: fitz.Document, axref: int, m: fitz.Matrix, scale: float) -> None:
+    """Apply matrix m (old PDF user space -> new PDF user space) to every geometric
+    key of one annotation object, in place."""
+    def pts(nums):
+        out = []
+        for i in range(0, len(nums) - 1, 2):
+            p = fitz.Point(nums[i], nums[i + 1]) * m
+            out += [p.x, p.y]
+        return out
+
+    t, v = doc.xref_get_key(axref, "Rect")
+    if t == "array":
+        r = _num_list(v)
+        if len(r) == 4:
+            nr = fitz.Rect(r) * m
+            nr.normalize()
+            doc.xref_set_key(axref, "Rect", f"[{_fmt_nums(nr)}]")
+    for key in ("QuadPoints", "Vertices", "L", "CL"):
+        t, v = doc.xref_get_key(axref, key)
+        if t == "array":
+            doc.xref_set_key(axref, key, f"[{_fmt_nums(pts(_num_list(v)))}]")
+    t, v = doc.xref_get_key(axref, "InkList")
+    if t == "array":
+        strokes = re.findall(r"\[([^\[\]]*)\]", v)
+        doc.xref_set_key(axref, "InkList", "[" + " ".join(f"[{_fmt_nums(pts(_num_list(sv)))}]" for sv in strokes) + "]")
+    t, v = doc.xref_get_key(axref, "RD")
+    if t == "array":
+        doc.xref_set_key(axref, "RD", f"[{_fmt_nums([x * scale for x in _num_list(v)])}]")
+    # Appearance streams are fitted to /Rect by the viewer, and m is a uniform
+    # scale + translation, so /AP needs no change.
+
+
 @router.post("/{doc_id}/organize/resize")
 async def resize_pages(doc_id: str, req: ResizeRequest):
     """Change page size. Content is scaled to fit (keeping proportions) or centered at 100%.
 
-    Implementation: each target page is rebuilt as a new page that shows the
-    original page as a Form XObject (vector content preserved, text still
-    selectable). Annotations on resized pages are re-created by insert_pdf where
-    possible; see the module report for limits."""
+    The page object itself is kept (so links, bookmarks and structure that point at
+    it stay valid): its content is replaced by a Form XObject of the original
+    visible page, its boxes/rotation are reset, and every annotation on it (comments,
+    markup, ink, links, form widgets, popups) gets its /Rect, /QuadPoints, /InkList,
+    /Vertices, /L, /CL and /RD transformed by the same matrix as the content."""
     if req.size == "custom":
         if not req.width or not req.height or req.width < 36 or req.height < 36:
             raise HTTPException(status_code=400, detail="custom size needs width and height >= 36")
@@ -472,29 +538,58 @@ async def resize_pages(doc_id: str, req: ResizeRequest):
 
     doc, path = _open(doc_id)
     pages = _check_pages(doc, req.pages)
-    toc = doc.get_toc(simple=False)
     src = fitz.open(stream=doc.tobytes(), filetype="pdf")
     snapshot(doc_id, f"Resize {len(pages)} page(s)")
     for p in sorted(pages):
-        sp = src[p]
-        sw, sh = sp.rect.width, sp.rect.height  # visible size
+        page = doc[p]
+        rot = page.rotation
+        sw, sh = page.rect.width, page.rect.height  # visible size
         w, h = tw, th
         if req.match_orientation and (sw > sh) != (w > h):
             w, h = h, w
-        newp = doc.new_page(pno=p, width=w, height=h)
+        # Work in UNROTATED space and keep /Rotate: show_pdf_page draws the source
+        # page unrotated, and annotations live in unrotated space too, so the page
+        # looks exactly as before and annotations need only scale + translate.
+        swap = rot in (90, 270)
+        su_w, su_h = (sh, sw) if swap else (sw, sh)
+        wu, hu = (h, w) if swap else (w, h)
         if req.scale_content:
-            target = newp.rect
+            target = fitz.Rect(0, 0, wu, hu)
         else:
-            x0 = (w - sw) / 2
-            y0 = (h - sh) / 2
-            target = fitz.Rect(x0, y0, x0 + sw, y0 + sh)
-        newp.show_pdf_page(target, src, p, keep_proportion=True)
-        doc.delete_page(p + 1)
+            x0 = (wu - su_w) / 2
+            y0 = (hu - su_h) / 2
+            target = fitz.Rect(x0, y0, x0 + su_w, y0 + su_h)
+        # where show_pdf_page(keep_proportion=True) puts the source inside target
+        s = min(target.width / su_w, target.height / su_h)
+        ox = target.x0 + (target.width - su_w * s) / 2
+        oy = target.y0 + (target.height - su_h * s) / 2
+        m = (_pdf_to_unrotated_matrix(doc, page)
+             * fitz.Matrix(s, 0, 0, s, ox, oy)
+             * fitz.Matrix(1, 0, 0, -1, 0, hu))  # new page: MediaBox [0 0 wu hu]
+        annot_xrefs = [a[0] for a in page.annot_xrefs()]
+
+        # reset the page in place and redraw the old page into it
+        empty = doc.get_new_xref()
+        doc.update_object(empty, "<<>>")
+        doc.update_stream(empty, b" ")
+        doc.xref_set_key(page.xref, "Contents", f"{empty} 0 R")
+        doc.xref_set_key(page.xref, "Resources", "<<>>")
+        for key in ("CropBox", "TrimBox", "BleedBox", "ArtBox"):
+            doc.xref_set_key(page.xref, key, "null")
+        doc.xref_set_key(page.xref, "Rotate", "0")
+        doc.xref_set_key(page.xref, "MediaBox", f"[0 0 {_fmt_nums((wu, hu))}]")
+        page = doc.reload_page(page)
+        if src[p].rotation:
+            # show_pdf_page sizes its clip from the ROTATED rect but draws unrotated
+            # content (it would crop a rotated page), so unrotate the scratch copy.
+            src[p].set_rotation(0)
+        page.show_pdf_page(target, src, p, keep_proportion=True)
+        if rot:
+            page.set_rotation(rot)
+
+        for ax in annot_xrefs:
+            _transform_annot_geometry(doc, ax, m, s)
     src.close()
-    try:
-        doc.set_toc(toc)
-    except Exception:
-        pass
     _save(doc, path)
     return {"status": "ok", "width": tw, "height": th}
 
@@ -669,26 +764,349 @@ def _validate_hf(req: HeaderFooterRequest):
         raise HTTPException(status_code=400, detail="Invalid date_format")
 
 
-def _stamp_header_footer(doc: fitz.Document, req: HeaderFooterRequest) -> list[dict]:
+# Removable header/footer "runs".
+#
+# Every stamp call is a *run* with a short id. Its text is written into the page
+# content wrapped in Acrobat's pagination-artifact marked content:
+#
+#     /Artifact <</Type /Pagination /Subtype /Header /Attached [/Top] /PylorRun /r1a2b3c4d>> BDC
+#       q BT ... ET Q
+#     EMC
+#
+# (Subtype /Footer and /Attached [/Bottom] for footer slots), which is the same
+# structure Adobe Acrobat writes for Header & Footer / Bates. The run's settings
+# are kept in the catalog under /PylorHFRuns so a run can be updated later.
+# Removal deletes the BDC..EMC span from the content stream, so the rest of the
+# page content is untouched. Pagination artifacts WITHOUT a /PylorRun key (i.e.
+# written by Acrobat or another tool) are reported as the run "acrobat" and can
+# be removed the same way; Form XObjects tagged with Acrobat's
+# /PieceInfo /ADBE_CompoundType /Private /Header|/Footer are removed too.
+
+_RUNS_KEY = "PylorHFRuns"
+_HF_SUBTYPES = {"Header", "Footer"}
+FOREIGN_RUN = "acrobat"
+_RUN_ID_RE = re.compile(r"^r[0-9a-f]{8}$")
+_WS = b" \t\r\n\f\x00"
+_DELIM = b"()<>[]{}/%"
+
+
+def _set_key_path(doc: fitz.Document, xref: int, path: str, value: str) -> None:
+    """xref_set_key for a '/'-separated path, following indirect objects on the way
+    (PyMuPDF refuses a path that runs through an indirect reference)."""
+    keys = path.split("/")
+    for i in range(len(keys) - 1):
+        t, v = doc.xref_get_key(xref, "/".join(keys[: i + 1]))
+        if t == "xref":
+            return _set_key_path(doc, int(v.split()[0]), "/".join(keys[i + 1:]), value)
+        if t == "null":
+            if value == "null":
+                return  # nothing to delete
+            break
+    doc.xref_set_key(xref, path, value)
+
+
+def _new_run_id() -> str:
+    return "r" + uuid.uuid4().hex[:8]
+
+
+def _cs_tokens(data: bytes):
+    """Minimal PDF content-stream lexer. Yields (kind, start, end) where kind is
+    one of 'op', 'name', 'str', 'hex', 'num', '<<', '>>', '[', ']'. Inline image
+    data (BI .. ID <binary> EI) is skipped as a single 'op' token 'EI'."""
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i:i + 1]
+        if c in (b" ", b"\t", b"\r", b"\n", b"\f", b"\x00"):
+            i += 1
+        elif c == b"%":
+            while i < n and data[i:i + 1] not in (b"\r", b"\n"):
+                i += 1
+        elif c == b"(":
+            s, depth = i, 0
+            while i < n:
+                ch = data[i:i + 1]
+                if ch == b"\\":
+                    i += 2
+                    continue
+                if ch == b"(":
+                    depth += 1
+                elif ch == b")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            yield "str", s, i
+        elif c == b"<":
+            if data[i + 1:i + 2] == b"<":
+                yield "<<", i, i + 2
+                i += 2
+            else:
+                s = i
+                j = data.find(b">", i)
+                i = n if j < 0 else j + 1
+                yield "hex", s, i
+        elif c == b">":
+            if data[i + 1:i + 2] == b">":
+                yield ">>", i, i + 2
+                i += 2
+            else:
+                i += 1
+        elif c in (b"[", b"]", b"{", b"}"):
+            yield (c.decode() if c in (b"[", b"]") else "op"), i, i + 1
+            i += 1
+        elif c == b"/":
+            s = i
+            i += 1
+            while i < n and data[i] not in _WS and data[i] not in _DELIM:
+                i += 1
+            yield "name", s, i
+        else:
+            s = i
+            while i < n and data[i] not in _WS and data[i] not in _DELIM:
+                i += 1
+            if i == s:  # stray delimiter
+                i += 1
+                continue
+            word = data[s:i]
+            if re.fullmatch(rb"[+\-]?(\d+\.?\d*|\.\d+)", word):
+                yield "num", s, i
+            elif word == b"ID":
+                # inline image data runs until whitespace + EI + whitespace/EOF
+                j = i + 1
+                while True:
+                    k = data.find(b"EI", j)
+                    if k < 0:
+                        i = n
+                        break
+                    before = data[k - 1:k]
+                    after = data[k + 2:k + 3]
+                    if before in (b" ", b"\t", b"\r", b"\n", b"\f", b"\x00") and (after == b"" or after in (b" ", b"\t", b"\r", b"\n", b"\f", b"\x00")):
+                        i = k + 2
+                        break
+                    j = k + 2
+                yield "op", s, i  # whole ID..EI as one operator token
+            else:
+                yield "op", s, i
+
+
+def _resolve_props(doc: fitz.Document, page: fitz.Page, name: str) -> str:
+    """Text of a named property list (/Artifact /MC0 BDC) from page resources."""
+    for xref in (page.xref,):
+        t, v = doc.xref_get_key(xref, f"Resources/Properties/{name}")
+        if t == "xref":
+            return doc.xref_object(int(v.split()[0]), compressed=True)
+        if t == "dict":
+            return v
+    return ""
+
+
+def _xobject_hf_kind(doc: fitz.Document, page: fitz.Page, name: str) -> Optional[str]:
+    """'Header'/'Footer' if the named XObject carries Acrobat's ADBE_CompoundType marker."""
+    t, v = doc.xref_get_key(page.xref, f"Resources/XObject/{name}")
+    if t != "xref":
+        return None
+    xx = int(v.split()[0])
+    t2, priv = doc.xref_get_key(xx, "PieceInfo/ADBE_CompoundType/Private")
+    if t2 == "name" and priv.lstrip("/") in _HF_SUBTYPES:
+        return priv.lstrip("/")
+    return None
+
+
+def _prop_info(props: str) -> Optional[dict]:
+    """Parse an /Artifact property list; return info if it is a header/footer pagination artifact."""
+    compact = re.sub(r"\s+", " ", props)
+    if not re.search(r"/Type\s*/Pagination\b", compact):
+        return None
+    m = re.search(r"/Subtype\s*/(\w+)", compact)
+    sub = m.group(1) if m else None
+    if sub not in _HF_SUBTYPES:
+        return None  # e.g. /Watermark, /Background: not a header/footer
+    r = re.search(r"/PylorRun\s*/(r[0-9a-f]{8})\b", compact)
+    return {"subtype": sub, "run": r.group(1) if r else FOREIGN_RUN}
+
+
+def _scan_hf_spans(doc: fitz.Document, page: fitz.Page, data: bytes) -> list[dict]:
+    """Find header/footer marked-content spans and tagged XObject invocations.
+    Returns [{start, end, run, subtype}] (outermost only, byte offsets)."""
+    spans: list[dict] = []
+    operands: list[tuple[str, int, int]] = []  # complete depth-0 operands
+    depth = 0
+    obj_start = 0
+    mc_stack: list[Optional[dict]] = []
+    for kind, s, e in _cs_tokens(data):
+        if kind in ("<<", "["):
+            if depth == 0:
+                obj_start = s
+            depth += 1
+            continue
+        if kind in (">>", "]"):
+            depth = max(0, depth - 1)
+            if depth == 0:
+                operands.append(("dict" if kind == ">>" else "array", obj_start, e))
+            continue
+        if depth > 0:
+            continue
+        if kind != "op":
+            operands.append((kind, s, e))
+            continue
+        op = data[s:e]
+        if op == b"BDC" and len(operands) >= 2:
+            tag_k, ts, te = operands[-2]
+            prop_k, ps, pe = operands[-1]
+            info = None
+            if tag_k == "name" and data[ts:te] == b"/Artifact":
+                if prop_k == "dict":
+                    info = _prop_info(data[ps:pe].decode("latin-1"))
+                elif prop_k == "name":
+                    info = _prop_info(_resolve_props(doc, page, data[ps + 1:pe].decode("latin-1")))
+            outer_target = any(m is not None for m in mc_stack)
+            if info and not outer_target:
+                mc_stack.append({**info, "start": ts})
+            else:
+                mc_stack.append(None)
+        elif op in (b"BMC", b"BDC"):
+            mc_stack.append(None)
+        elif op == b"EMC":
+            if mc_stack:
+                top = mc_stack.pop()
+                if top is not None:
+                    spans.append({"start": top["start"], "end": e, "run": top["run"], "subtype": top["subtype"]})
+        elif op == b"Do" and operands and operands[-1][0] == "name" and not any(m is not None for m in mc_stack):
+            k, ns, ne = operands[-1]
+            sub = _xobject_hf_kind(doc, page, data[ns + 1:ne].decode("latin-1"))
+            if sub:
+                spans.append({"start": ns, "end": e, "run": FOREIGN_RUN, "subtype": sub})
+        operands = []
+    return spans
+
+
+def _page_streams(doc: fitz.Document, page: fitz.Page) -> list[int]:
+    return list(page.get_contents())
+
+
+def _page_hf_spans(doc: fitz.Document, page: fitz.Page) -> list[tuple[int, list[dict]]]:
+    """Per content stream: (xref, spans). Streams are scanned one by one; a span that
+    is opened in one stream and closed in another is handled by merging the page's
+    streams first (see _remove_spans)."""
+    out = []
+    for x in _page_streams(doc, page):
+        data = doc.xref_stream(x) or b""
+        out.append((x, _scan_hf_spans(doc, page, data)))
+    return out
+
+
+def _merge_page_contents(doc: fitz.Document, page: fitz.Page) -> None:
+    xs = _page_streams(doc, page)
+    if len(xs) <= 1:
+        return
+    merged = b"\n".join((doc.xref_stream(x) or b"") for x in xs)
+    doc.update_stream(xs[0], merged)
+    doc.xref_set_key(page.xref, "Contents", f"{xs[0]} 0 R")
+
+
+def _needs_merge(doc: fitz.Document, page: fitz.Page) -> bool:
+    """True if a pagination artifact is split across content streams."""
+    xs = _page_streams(doc, page)
+    if len(xs) <= 1:
+        return False
+    per_stream = sum(len(_scan_hf_spans(doc, page, doc.xref_stream(x) or b"")) for x in xs)
+    merged = b"\n".join((doc.xref_stream(x) or b"") for x in xs)
+    return len(_scan_hf_spans(doc, page, merged)) != per_stream
+
+
+def _remove_spans(doc: fitz.Document, page: fitz.Page, runs: Optional[set[str]]) -> int:
+    """Delete header/footer spans whose run is in `runs` (None = all). Returns count."""
+    if _needs_merge(doc, page):
+        _merge_page_contents(doc, page)
+    removed = 0
+    for x, spans in _page_hf_spans(doc, page):
+        doomed = [s for s in spans if runs is None or s["run"] in runs]
+        if not doomed:
+            continue
+        data = doc.xref_stream(x) or b""
+        for s in sorted(doomed, key=lambda v: v["start"], reverse=True):
+            data = data[:s["start"]] + b"\n" + data[s["end"]:]
+            removed += 1
+        doc.update_stream(x, data)
+    if runs is None or FOREIGN_RUN in runs:
+        # Acrobat's page-level marker; harmless if absent.
+        t, _v = doc.xref_get_key(page.xref, "PieceInfo/ADBE_CompoundType/Private")
+        if t == "name" and _v.lstrip("/") in _HF_SUBTYPES:
+            _set_key_path(doc, page.xref, "PieceInfo/ADBE_CompoundType", "null")
+            removed += 0 if removed else 1
+    return removed
+
+
+def _wrap_new_streams(doc: fitz.Document, page: fitz.Page, before: set[int], subtype: str, run_id: str) -> None:
+    attached = "Top" if subtype == "Header" else "Bottom"
+    head = (f"/Artifact <</Type /Pagination /Subtype /{subtype} /Attached [/{attached}] "
+            f"/PylorRun /{run_id}>> BDC\n").encode()
+    for x in _page_streams(doc, page):
+        if x in before:
+            continue
+        data = doc.xref_stream(x) or b""
+        if b"BT" not in data:
+            continue  # a q / Q wrapper stream PyMuPDF added around older content
+        # q..Q outermost so PyMuPDF still sees the page as "wrapped" next time.
+        doc.update_stream(x, b"q\n" + head + data + b"\nEMC\nQ\n")
+
+
+def _registry_get(doc: fitz.Document) -> dict[str, dict]:
+    import json as _json
+    cat = doc.pdf_catalog()
+    t, v = doc.xref_get_key(cat, _RUNS_KEY)
+    if t not in ("dict", "xref"):
+        return {}
+    if t == "xref":
+        v = doc.xref_object(int(v.split()[0]), compressed=True)
+    out = {}
+    for rid in re.findall(r"/(r[0-9a-f]{8})\b", v):
+        tt, sv = doc.xref_get_key(cat, f"{_RUNS_KEY}/{rid}")
+        if tt == "string":
+            try:
+                out[rid] = _json.loads(sv)
+            except ValueError:
+                pass
+    return out
+
+
+def _registry_set(doc: fitz.Document, run_id: str, entry: Optional[dict]) -> None:
+    import json as _json
+    cat = doc.pdf_catalog()
+    if entry is None:
+        if doc.xref_get_key(cat, f"{_RUNS_KEY}/{run_id}")[0] != "null":
+            _set_key_path(doc, cat, f"{_RUNS_KEY}/{run_id}", "null")
+        return
+    _set_key_path(doc, cat, f"{_RUNS_KEY}/{run_id}", fitz.get_pdf_str(_json.dumps(entry)))
+
+
+def _stamp_header_footer(doc: fitz.Document, req: HeaderFooterRequest, run_id: Optional[str] = None) -> list[dict]:
     plan = _plan_header_footer(req, len(doc))
     fs = req.font_size
     for item in plan:
         page = doc[item["page"]]
         W, H = page.rect.width, page.rect.height  # visible size
-        for slot, text in item["texts"].items():
-            tw = fitz.get_text_length(text, fontname=req.font, fontsize=fs)
-            if slot.startswith("header"):
-                y = req.margin_top + fs * 0.8  # baseline: top margin to cap-height
-            else:
-                y = H - req.margin_bottom
-            if slot.endswith("left"):
-                x = req.margin_left
-            elif slot.endswith("center"):
-                x = (W - tw) / 2
-            else:
-                x = W - req.margin_right - tw
-            pt = _vis_point_to_page(page, (x, y))
-            page.insert_text(pt, text, fontsize=fs, fontname=req.font, color=req.color, rotate=page.rotation)
+        for group in ("header", "footer"):
+            texts = {s: t for s, t in item["texts"].items() if s.startswith(group)}
+            if not texts:
+                continue
+            before = set(_page_streams(doc, page))
+            shape = page.new_shape()
+            for slot, text in texts.items():
+                tw = fitz.get_text_length(text, fontname=req.font, fontsize=fs)
+                y = req.margin_top + fs * 0.8 if group == "header" else H - req.margin_bottom
+                if slot.endswith("left"):
+                    x = req.margin_left
+                elif slot.endswith("center"):
+                    x = (W - tw) / 2
+                else:
+                    x = W - req.margin_right - tw
+                pt = _vis_point_to_page(page, (x, y))
+                shape.insert_text(pt, text, fontsize=fs, fontname=req.font, color=req.color, rotate=page.rotation)
+            shape.commit()
+            if run_id:
+                _wrap_new_streams(doc, page, before, "Header" if group == "header" else "Footer", run_id)
     return plan
 
 
@@ -702,14 +1120,135 @@ async def header_footer_preview(doc_id: str, req: HeaderFooterRequest):
     return {"pages": plan[:5], "stamped_count": len(plan)}
 
 
-@router.post("/{doc_id}/organize/header-footer")
-async def add_header_footer(doc_id: str, req: HeaderFooterRequest):
+RunKind = Literal["header-footer", "page-numbers", "bates"]
+
+
+def _add_run(doc_id: str, req: HeaderFooterRequest, kind: str, label: str) -> dict:
     _validate_hf(req)
     doc, path = _open(doc_id)
-    snapshot(doc_id, "Add header/footer")
-    plan = _stamp_header_footer(doc, req)
+    snapshot(doc_id, label)
+    run_id = _new_run_id()
+    plan = _stamp_header_footer(doc, req, run_id)
+    _registry_set(doc, run_id, {"kind": kind, "created": _pdf_date(), "settings": req.model_dump()})
     _save(doc, path)
-    return {"status": "ok", "stamped_count": len(plan), "first": plan[0] if plan else None}
+    return {"status": "ok", "run_id": run_id, "stamped_count": len(plan), "first": plan[0] if plan else None}
+
+
+@router.post("/{doc_id}/organize/header-footer")
+async def add_header_footer(doc_id: str, req: HeaderFooterRequest):
+    return _add_run(doc_id, req, "header-footer", "Add header/footer")
+
+
+def _list_runs(doc: fitz.Document) -> list[dict]:
+    reg = _registry_get(doc)
+    found: dict[str, dict] = {}
+    for page in doc:
+        for _x, spans in _page_hf_spans(doc, page):
+            for s in spans:
+                r = found.setdefault(s["run"], {"pages": set(), "subtypes": set()})
+                r["pages"].add(page.number)
+                r["subtypes"].add(s["subtype"])
+        t, v = doc.xref_get_key(page.xref, "PieceInfo/ADBE_CompoundType/Private")
+        if t == "name" and v.lstrip("/") in _HF_SUBTYPES:
+            r = found.setdefault(FOREIGN_RUN, {"pages": set(), "subtypes": set()})
+            r["pages"].add(page.number)
+            r["subtypes"].add(v.lstrip("/"))
+    runs = []
+    for rid, r in found.items():
+        entry = reg.get(rid)
+        runs.append({
+            "id": rid,
+            "source": "pylor" if rid != FOREIGN_RUN else "external",
+            "kind": entry["kind"] if entry else "header-footer",
+            "pages": sorted(r["pages"]),
+            "subtypes": sorted(r["subtypes"]),
+            "created": _parse_pdf_date(entry.get("created", "")) if entry else None,
+            "settings": entry["settings"] if entry else None,
+            "editable": entry is not None,
+        })
+    runs.sort(key=lambda r: (r["source"] != "external", r["created"] or "", r["id"]))
+    return runs
+
+
+@router.get("/{doc_id}/organize/header-footer/runs")
+async def list_header_footer_runs(doc_id: str):
+    """Header/footer/page-number/Bates runs found in the page content, ours and Acrobat's."""
+    doc, _ = _open(doc_id)
+    runs = _list_runs(doc)
+    doc.close()
+    return {"runs": runs}
+
+
+def _check_run_id(run_id: str) -> None:
+    if run_id != FOREIGN_RUN and not _RUN_ID_RE.match(run_id):
+        raise HTTPException(status_code=400, detail="Invalid run id")
+
+
+def _remove_runs(doc: fitz.Document, runs: Optional[set[str]]) -> int:
+    removed = 0
+    for page in doc:
+        removed += _remove_spans(doc, page, runs)
+    reg = _registry_get(doc)
+    for rid in list(reg):
+        if runs is None or rid in runs:
+            _registry_set(doc, rid, None)
+    return removed
+
+
+@router.delete("/{doc_id}/organize/header-footer/runs/{run_id}")
+async def remove_header_footer_run(doc_id: str, run_id: str):
+    """Remove one run. run_id 'acrobat' removes every pagination header/footer not made here."""
+    _check_run_id(run_id)
+    doc, path = _open(doc_id)
+    if run_id not in {r["id"] for r in _list_runs(doc)}:
+        doc.close()
+        raise HTTPException(status_code=404, detail="Header/footer run not found")
+    snapshot(doc_id, "Remove header/footer")
+    removed = _remove_runs(doc, {run_id})
+    runs = _list_runs(doc)
+    _save(doc, path)
+    return {"status": "ok", "removed": removed, "runs": runs}
+
+
+@router.delete("/{doc_id}/organize/header-footer/runs")
+async def remove_all_header_footer_runs(doc_id: str):
+    """Acrobat's 'Remove': every header/footer/page-number/Bates run, ours and foreign."""
+    doc, path = _open(doc_id)
+    if not _list_runs(doc):
+        doc.close()
+        return {"status": "ok", "removed": 0, "runs": []}
+    snapshot(doc_id, "Remove all headers/footers")
+    removed = _remove_runs(doc, None)
+    _save(doc, path)
+    return {"status": "ok", "removed": removed, "runs": []}
+
+
+class UpdateRunRequest(HeaderFooterRequest):
+    kind: Optional[RunKind] = None
+
+
+@router.put("/{doc_id}/organize/header-footer/runs/{run_id}")
+async def update_header_footer_run(doc_id: str, run_id: str, req: UpdateRunRequest):
+    """Replace a run's text/format: its old marked content is removed and the run is
+    re-stamped (same id) with the new settings. Updating 'acrobat' replaces the
+    foreign header/footer with a new, editable run."""
+    _check_run_id(run_id)
+    hf = HeaderFooterRequest(**req.model_dump(exclude={"kind"}))
+    _validate_hf(hf)
+    doc, path = _open(doc_id)
+    existing = {r["id"]: r for r in _list_runs(doc)}
+    if run_id not in existing:
+        doc.close()
+        raise HTTPException(status_code=404, detail="Header/footer run not found")
+    snapshot(doc_id, "Update header/footer")
+    _remove_runs(doc, {run_id})
+    new_id = run_id if run_id != FOREIGN_RUN else _new_run_id()
+    plan = _stamp_header_footer(doc, hf, new_id)
+    kind = req.kind or existing[run_id]["kind"]
+    _registry_set(doc, new_id, {"kind": kind, "created": _pdf_date(), "settings": hf.model_dump()})
+    runs = _list_runs(doc)
+    _save(doc, path)
+    return {"status": "ok", "run_id": new_id, "stamped_count": len(plan), "runs": runs}
 
 
 Position = Literal["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"]
@@ -738,7 +1277,7 @@ class PageNumbersRequest(BaseModel):
 @router.post("/{doc_id}/organize/page-numbers")
 async def add_page_numbers(doc_id: str, req: PageNumbersRequest):
     hf = HeaderFooterRequest(**req.model_dump(exclude={"format", "position"}), **{_slot_for(req.position): req.format})
-    return await add_header_footer(doc_id, hf)
+    return _add_run(doc_id, hf, "page-numbers", "Add header/footer")
 
 
 class BatesRequest(BaseModel):
@@ -769,7 +1308,7 @@ async def add_bates(doc_id: str, req: BatesRequest):
         bates_start=req.start,
         **{_slot_for(req.position): "{bates}"},
     )
-    result = await add_header_footer(doc_id, hf)
+    result = _add_run(doc_id, hf, "bates", "Add header/footer")
     first = result.get("first")
     return {**result, "first_bates": first["bates"] if first else None}
 
@@ -836,18 +1375,78 @@ async def replace_bookmarks(doc_id: str, req: ReplaceBookmarksRequest):
     return {"status": "ok", "bookmarks": items}
 
 
-class AddBookmarkRequest(BookmarkItem):
-    index: Optional[int] = None  # insert position in the flat list; default append
+class AddBookmarkRequest(BaseModel):
+    title: str
+    page: int  # 0-based target page
+    # Default (no parent, no index): a TOP-LEVEL bookmark inserted among the
+    # top-level bookmarks in page order (after any existing ones on the same page).
+    parent: Optional[int] = None  # flat index of the parent: insert as its child, in page order
+    index: Optional[int] = None  # explicit flat insert position (legacy); needs a valid level
+    level: Optional[int] = None  # only used with `index`
+
+
+def _subtree_end(toc: list, i: int) -> int:
+    lvl = toc[i][0]
+    j = i + 1
+    while j < len(toc) and toc[j][0] > lvl:
+        j += 1
+    return j
+
+
+def _page_order_slot(toc: list, page1: int, parent: Optional[int]) -> tuple[int, int]:
+    """(flat insert index, level) for a new bookmark among its siblings in page order."""
+    if parent is None:
+        lo, hi, level = 0, len(toc), 1
+    else:
+        lo, hi, level = parent + 1, _subtree_end(toc, parent), toc[parent][0] + 1
+    i = lo
+    while i < hi:
+        if toc[i][0] == level and toc[i][2] > page1:
+            return i, level
+        i = _subtree_end(toc, i) if toc[i][0] == level else i + 1
+    return hi, level
+
+
+def _move_subtree(toc: list, src: int, target: int, position: str) -> tuple[list, int]:
+    """Move bookmark `src` with its children before/after/inside bookmark `target`.
+    Returns (new toc, new flat index of the moved bookmark)."""
+    n = len(toc)
+    if not (0 <= src < n) or not (0 <= target < n):
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    end = _subtree_end(toc, src)
+    if src <= target < end:
+        raise HTTPException(status_code=400, detail="Cannot move a bookmark into itself")
+    block = [list(b) for b in toc[src:end]]
+    rest = [list(b) for b in toc[:src] + toc[end:]]
+    t = target if target < src else target - (end - src)
+    if position == "before":
+        ins, new_level = t, rest[t][0]
+    elif position == "after":
+        ins, new_level = _subtree_end(rest, t), rest[t][0]
+    elif position == "inside":  # as the last child
+        ins, new_level = _subtree_end(rest, t), rest[t][0] + 1
+    else:
+        raise HTTPException(status_code=400, detail="position must be before, after or inside")
+    delta = new_level - block[0][0]
+    for b in block:
+        b[0] += delta
+    return rest[:ins] + block + rest[ins:], ins
 
 
 @router.post("/{doc_id}/organize/bookmarks")
 async def add_bookmark(doc_id: str, req: AddBookmarkRequest):
     doc, path = _open(doc_id)
     toc = doc.get_toc(simple=False)
-    idx = len(toc) if req.index is None else max(0, min(req.index, len(toc)))
-    toc.insert(idx, [req.level, req.title, req.page + 1])
     try:
         _check_page(doc, req.page)
+        if req.index is not None:
+            idx = max(0, min(req.index, len(toc)))
+            level = req.level or 1
+        else:
+            if req.parent is not None and not (0 <= req.parent < len(toc)):
+                raise HTTPException(status_code=404, detail="Parent bookmark not found")
+            idx, level = _page_order_slot(toc, req.page + 1, req.parent)
+        toc.insert(idx, [level, req.title, req.page + 1])
         _validate_toc_levels(toc)
         snapshot(doc_id, f"Add bookmark '{req.title}'")
         _apply_toc(doc, toc)
@@ -856,7 +1455,61 @@ async def add_bookmark(doc_id: str, req: AddBookmarkRequest):
         raise
     items = _bookmarks_payload(doc)
     _save(doc, path)
-    return {"status": "ok", "bookmarks": items}
+    return {"status": "ok", "index": idx, "bookmarks": items}
+
+
+class MoveBookmarkRequest(BaseModel):
+    target: int  # flat index of the bookmark to drop on
+    position: Literal["before", "after", "inside"] = "before"
+
+
+@router.post("/{doc_id}/organize/bookmarks/{index}/move")
+async def move_bookmark(doc_id: str, index: int, req: MoveBookmarkRequest):
+    """Drag-reorder / nest / un-nest: moves the bookmark together with its children.
+    Destinations, colours and styles of every bookmark are preserved."""
+    doc, path = _open(doc_id)
+    toc = doc.get_toc(simple=False)
+    try:
+        new_toc, new_index = _move_subtree(toc, index, req.target, req.position)
+        _validate_toc_levels(new_toc)
+        snapshot(doc_id, "Move bookmark")
+        doc.set_toc(new_toc)
+    except HTTPException:
+        doc.close()
+        raise
+    items = _bookmarks_payload(doc)
+    _save(doc, path)
+    return {"status": "ok", "index": new_index, "bookmarks": items}
+
+
+@router.post("/{doc_id}/organize/bookmarks/{index}/indent")
+async def indent_bookmark(doc_id: str, index: int):
+    """Nest under the previous sibling (as its last child), children included."""
+    doc, _path = _open(doc_id)
+    toc = doc.get_toc(simple=False)
+    doc.close()
+    if not (0 <= index < len(toc)):
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    lvl = toc[index][0]
+    prev = next((i for i in range(index - 1, -1, -1) if toc[i][0] <= lvl), None)
+    if prev is None or toc[prev][0] != lvl:
+        raise HTTPException(status_code=400, detail="No previous sibling to nest under")
+    return await move_bookmark(doc_id, index, MoveBookmarkRequest(target=prev, position="inside"))
+
+
+@router.post("/{doc_id}/organize/bookmarks/{index}/outdent")
+async def outdent_bookmark(doc_id: str, index: int):
+    """Un-nest: becomes the next sibling of its parent, children included."""
+    doc, _path = _open(doc_id)
+    toc = doc.get_toc(simple=False)
+    doc.close()
+    if not (0 <= index < len(toc)):
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    lvl = toc[index][0]
+    if lvl <= 1:
+        raise HTTPException(status_code=400, detail="Already a top-level bookmark")
+    parent = next(i for i in range(index - 1, -1, -1) if toc[i][0] == lvl - 1)
+    return await move_bookmark(doc_id, index, MoveBookmarkRequest(target=parent, position="after"))
 
 
 class UpdateBookmarkRequest(BaseModel):
@@ -873,10 +1526,9 @@ async def update_bookmark(doc_id: str, index: int, req: UpdateBookmarkRequest):
         doc.close()
         raise HTTPException(status_code=404, detail="Bookmark not found")
     item = list(toc[index])
+    end = _subtree_end(toc, index)
     if req.title is not None:
         item[1] = req.title
-    if req.level is not None:
-        item[0] = req.level
     if req.page is not None:
         try:
             _check_page(doc, req.page)
@@ -884,6 +1536,12 @@ async def update_bookmark(doc_id: str, index: int, req: UpdateBookmarkRequest):
             doc.close()
             raise
         item = [item[0], item[1], req.page + 1]  # drop old destination details
+    if req.level is not None and req.level != item[0]:
+        # a level change carries the bookmark's children along with it
+        delta = req.level - item[0]
+        for j in range(index + 1, end):
+            toc[j] = [toc[j][0] + delta, *toc[j][1:]]
+        item[0] = req.level
     toc[index] = item
     try:
         _validate_toc_levels(toc)
@@ -1232,6 +1890,24 @@ class ReplyRequest(BaseModel):
     author: str = "User"
 
 
+def _make_thread_reply(doc: fitz.Document, reply: fitz.Annot, parent: fitz.Annot) -> None:
+    """Shape a reply the way Acrobat writes one, so viewers show it inside the
+    parent's thread instead of as a second sticky-note icon on the page:
+      /IRT parent, /RT /R (reply, not group), same /Rect as the parent,
+      /F Hidden|NoZoom|NoRotate|Print, /Open false, and no appearance stream."""
+    x = reply.xref
+    rect = doc.xref_get_key(parent.xref, "Rect")
+    if rect[0] == "array":
+        doc.xref_set_key(x, "Rect", rect[1])
+    doc.xref_set_key(x, "RT", "/R")
+    doc.xref_set_key(x, "Open", "false")
+    doc.xref_set_key(x, "F", str(fitz.PDF_ANNOT_IS_HIDDEN | fitz.PDF_ANNOT_IS_NO_ZOOM
+                                 | fitz.PDF_ANNOT_IS_NO_ROTATE | fitz.PDF_ANNOT_IS_PRINT))
+    doc.xref_set_key(x, "AP", "null")
+    # A reply must not carry its own popup: Acrobat shows it in the parent's popup.
+    doc.xref_set_key(x, "Popup", "null")
+
+
 @router.post("/{doc_id}/organize/comments/{xref}/reply")
 async def reply_comment(doc_id: str, xref: int, req: ReplyRequest):
     """Acrobat-style reply: a Text annotation whose /IRT points at the parent."""
@@ -1245,6 +1921,7 @@ async def reply_comment(doc_id: str, xref: int, req: ReplyRequest):
     reply = page.add_text_annot(parent.rect.tl, req.text, icon="Comment")
     reply.set_irt_xref(parent.xref)
     _finish(reply, author=req.author, content=req.text, subject="Reply", new=True)
+    _make_thread_reply(doc, reply, parent)
     result = _annot_dict(doc, page, reply)
     _save(doc, path)
     return {"status": "ok", "reply": result}

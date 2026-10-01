@@ -9,7 +9,7 @@
  */
 import { create } from "zustand";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, apiFetch } from "../api";
 
 export type PdfRect = [number, number, number, number];
 
@@ -166,7 +166,7 @@ async function errorFrom(res: Response, fallback: string): Promise<Error> {
 }
 
 async function jsonRequest<T>(path: string, init: RequestInit, fallback: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init);
+  const res = await apiFetch(`${API_BASE}${path}`, init);
   if (!res.ok) throw await errorFrom(res, fallback);
   return res.json() as Promise<T>;
 }
@@ -235,7 +235,7 @@ export function sanitizeDocument(docId: string, opts: SanitizeOptions) {
 
 /** apply_to_document=false → resolves to a Blob of the encrypted PDF. */
 export async function protectDocument(docId: string, opts: ProtectOptions): Promise<Blob | { status: string }> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/security/protect`, post(opts));
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/security/protect`, post(opts));
   if (!res.ok) throw await errorFrom(res, "Protect failed");
   if (opts.apply_to_document) return res.json();
   return res.blob();

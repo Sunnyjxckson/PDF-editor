@@ -257,7 +257,7 @@ export default function PageSidebar() {
 
             return (
               <div
-                key={`${i}-${pageVersion}`}
+                key={i /* stable across edits: the thumbnail swaps its image in place */}
                 ref={(el) => {
                   if (el) thumbRefs.current.set(i, el);
                   else thumbRefs.current.delete(i);
@@ -408,24 +408,34 @@ export default function PageSidebar() {
 }
 
 // ─── Cached Thumbnail Component ───────────────────────────────────────────────
-// Uses IntersectionObserver for lazy loading and caches loaded thumbnails
+// Lazy-loads via IntersectionObserver and caches loaded thumbnails as blob URLs.
+// After an edit (new pageVersion) the previous thumbnail stays on screen while
+// the new one loads off-screen; it is swapped in only once it has loaded, so
+// thumbnails never blank out or flash a spinner after each edit.
 
-function CachedThumbnail({ docId, pageIndex, pageVersion }: { docId: string; pageIndex: number; pageVersion: number }) {
-  const imgRef = useRef<HTMLImageElement>(null);
+export function CachedThumbnail({ docId, pageIndex, pageVersion }: { docId: string; pageIndex: number; pageVersion: number }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [isVisible, setIsVisible] = useState(false);
-  // Blob URL made after the first load, tagged with what it is a render of.
-  const [blob, setBlob] = useState<{ key: string; url: string } | null>(null);
+  // Without IntersectionObserver (jsdom) there is nothing to wait for. The window
+  // check keeps the server render identical to a real browser's first render.
+  const [isVisible, setIsVisible] = useState(
+    () => typeof window !== "undefined" && typeof IntersectionObserver === "undefined",
+  );
+  // What is on screen now (always a fully loaded image), tagged with its key.
+  const [shown, setShown] = useState<{ key: string; url: string } | null>(null);
   const key = `${docId}-${pageIndex}-${pageVersion}`;
-  const cached = isVisible ? getCachedThumbnail(docId, pageIndex, pageVersion) : undefined;
-  const url = isVisible ? `${getThumbnailUrl(docId, pageIndex)}?v=${pageVersion}` : null;
-  const src = cached ?? (blob?.key === key ? blob.url : url);
+  const target = isVisible
+    ? getCachedThumbnail(docId, pageIndex, pageVersion) ?? `${getThumbnailUrl(docId, pageIndex)}?v=${pageVersion}`
+    : null;
+  // A different document/page must not keep showing the old picture.
+  const samePage = shown?.key.startsWith(`${docId}-${pageIndex}-`) ?? false;
+  const src = shown && samePage ? shown.url : null;
 
   // IntersectionObserver for lazy loading
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-
+    // No IntersectionObserver (jsdom): visible from the first render, see useState below.
+    if (typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {
@@ -440,48 +450,55 @@ function CachedThumbnail({ docId, pageIndex, pageVersion }: { docId: string; pag
     return () => observer.disconnect();
   }, []);
 
-  // When visible, load once and keep a blob URL in the shared cache
+  // Preload the wanted version off-screen; swap it in on load, then cache it.
   useEffect(() => {
-    if (!isVisible || !url || getCachedThumbnail(docId, pageIndex, pageVersion)) return;
+    if (!target || shown?.key === key) return;
     let cancelled = false;
     const img = new Image();
     // The API is another origin: without CORS mode the canvas is tainted and
     // toBlob() throws. The backend allows any origin.
     img.crossOrigin = "anonymous";
     img.onload = () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.drawImage(img, 0, 0);
+      if (cancelled) return;
+      setShown({ key, url: target });
+      if (target.startsWith("blob:") || getCachedThumbnail(docId, pageIndex, pageVersion)) return;
       try {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0);
         canvas.toBlob((b) => {
-          if (!b || cancelled) return;
-          const blobUrl = URL.createObjectURL(b);
-          setCachedThumbnail(docId, pageIndex, pageVersion, blobUrl);
-          setBlob({ key, url: blobUrl });
+          if (!b) return;
+          setCachedThumbnail(docId, pageIndex, pageVersion, URL.createObjectURL(b));
         });
       } catch {
         // caching is an optimisation; the <img> already shows the URL
       }
     };
-    img.src = url;
-    return () => { cancelled = true; };
-  }, [isVisible, url, key, docId, pageIndex, pageVersion]);
+    img.onerror = () => {
+      if (!cancelled) setShown({ key, url: target }); // let the <img> show the broken state
+    };
+    img.src = target;
+    return () => {
+      cancelled = true;
+    };
+  }, [target, key, shown?.key, docId, pageIndex, pageVersion]);
 
   return (
     <div ref={containerRef} className="w-full aspect-[3/4] bg-gray-50 dark:bg-gray-800">
       {src ? (
+        // eslint-disable-next-line @next/next/no-img-element
         <img
-          ref={imgRef}
           src={src}
           alt={`Page ${pageIndex + 1}`}
+          data-version={shown?.key.split("-").pop()}
           className="w-full h-auto"
           draggable={false}
         />
       ) : (
-        <div className="w-full h-full flex items-center justify-center">
+        <div className="w-full h-full flex items-center justify-center" aria-label={`Loading page ${pageIndex + 1}`}>
           <div className="w-4 h-4 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin" />
         </div>
       )}

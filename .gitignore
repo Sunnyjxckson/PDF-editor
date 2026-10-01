@@ -20,3 +20,11 @@ backend/uploads/
 .vscode/
 .idea/
 .vercel
+
+# OCR languages installed from the UI (convert: PDF_EDITOR_TESSDATA_DIR overrides)
+backend/tessdata/
+
+# Digital IDs and trusted certificates (sign: stored under UPLOAD_DIR/_certs)
+_certs/
+*.p12
+*.pfx

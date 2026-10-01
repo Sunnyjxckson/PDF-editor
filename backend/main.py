@@ -27,6 +27,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+# advanced_ops must be imported first: it loads backend/.env and <repo>/.env
+# (override=False) so ANTHROPIC_API_KEY / UPLOAD_DIR etc. are visible to every
+# module below. Without it the AI chat silently falls back to regex locally.
+from backend import advanced_ops
 from backend import document_intelligence as doc_intel
 from backend.smart_replace import (
     smart_replace_in_doc,
@@ -47,10 +51,16 @@ from backend.features.sign import router as sign_router
 from backend.features.redact import router as redact_router
 from backend.features.convert import router as convert_router
 from backend.features.organize import router as organize_router
+from backend.features.ai import router as ai_router
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "uploads"))
+# One upload dir for the whole backend: the same Path object advanced_ops (undo
+# history, redact, text_edit, convert, organize) resolves from the env.
+UPLOAD_DIR = advanced_ops.UPLOAD_DIR
+# document_intelligence hardcodes Path("uploads"); point it at the same tree so
+# analysis.json lands next to the document (and is purged after redaction).
+doc_intel.UPLOAD_DIR = UPLOAD_DIR
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 FILE_TTL_HOURS = int(os.environ.get("FILE_TTL_HOURS", "24"))
@@ -106,7 +116,119 @@ app.include_router(objects_router)
 app.include_router(forms_router)
 app.include_router(organize_router)
 app.include_router(advanced_router)
+app.include_router(ai_router)
 
+# ─── Signed-document guard ────────────────────────────────────────────────
+#
+# Any write to a digitally signed PDF invalidates its signature(s). Every
+# mutating request (POST/PUT/PATCH/DELETE) on /api/pdf/{doc_id}/... is refused
+# with 409 {"code": "signed_document"} while the stored PDF contains a signed
+# signature field (/ByteRange), unless the client sends
+# X-Allow-Break-Signature: 1 after the user confirmed.
+#
+# Classification is by matched route template. Anything not listed below is
+# GUARDED by default, so a newly added route can never silently bypass this.
+
+ALLOW_BREAK_SIGNATURE_HEADER = "x-allow-break-signature"
+GUARDED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# Mutating-method routes that do NOT change the stored PDF.
+SIGNED_GUARD_ALLOW: frozenset[tuple[str, str]] = frozenset({
+    ("POST", "/api/pdf/{doc_id}/find"),
+    ("POST", "/api/pdf/{doc_id}/ask"),
+    ("POST", "/api/pdf/{doc_id}/sections/search"),
+    ("POST", "/api/pdf/{doc_id}/ai/assist"),
+    ("POST", "/api/pdf/{doc_id}/ai/configure"),       # sets the API key only
+    # Chat answers questions freely; if the AI/regex path tries to EDIT a
+    # signed doc the handler reverts the file and returns the same 409.
+    ("POST", "/api/pdf/{doc_id}/chat"),
+    ("POST", "/api/pdf/{doc_id}/redact/search"),       # returns matches only
+    ("POST", "/api/pdf/{doc_id}/organize/header-footer/preview"),
+    ("POST", "/api/pdf/{doc_id}/export-images"),
+    ("POST", "/api/pdf/{doc_id}/split"),               # writes NEW docs only
+    ("POST", "/api/pdf/{doc_id}/organize/split"),      # writes NEW docs only
+    ("POST", "/api/pdf/{doc_id}/annotations/{page_num}"),  # sidecar JSON, not the PDF
+    # Undo/redo restore a byte-identical earlier version (e.g. undoing a
+    # signature); they never produce a modified-but-still-"signed" file.
+    ("POST", "/api/pdf/{doc_id}/undo"),
+    ("POST", "/api/pdf/{doc_id}/redo"),
+    ("DELETE", "/api/pdf/{doc_id}"),                   # discards the upload
+})
+
+# The sign router keeps its own behaviour (incremental pyHanko signing must
+# keep earlier signatures valid; its visual tools already refuse signed docs).
+SIGNED_GUARD_EXEMPT_PREFIXES: tuple[str, ...] = ("/api/pdf/{doc_id}/sign/",)
+
+
+def signed_guard_classify(method: str, template: str) -> str:
+    """'read' | 'exempt' | 'guard' for a (method, route template)."""
+    method = method.upper()
+    if method not in GUARDED_METHODS:
+        return "read"
+    if (method, template) in SIGNED_GUARD_ALLOW:
+        return "read"
+    if any(template.startswith(p) for p in SIGNED_GUARD_EXEMPT_PREFIXES):
+        return "exempt"
+    if "{doc_id}" not in template:
+        return "read"  # not bound to a stored document (upload, create, compare...)
+    return "guard"
+
+
+def _signed_conflict(doc_id: str, info: dict) -> JSONResponse:
+    signers = [s for s in info.get("signers", []) if s]
+    who = ", ".join(signers) if signers else "an unknown signer"
+    return JSONResponse(
+        status_code=409,
+        content={
+            "code": "signed_document",
+            "detail": (
+                f"This PDF is digitally signed by {who}. Editing it will invalidate "
+                f"the signature."
+            ),
+            "override_header": "X-Allow-Break-Signature: 1",
+            "doc_id": doc_id,
+            "signers": signers,
+            "signature_count": info.get("count", 0),
+        },
+    )
+
+
+def _allow_break(request: Request) -> bool:
+    return request.headers.get(ALLOW_BREAK_SIGNATURE_HEADER, "").strip().lower() in ("1", "true", "yes")
+
+
+def _match_route(scope) -> tuple[Optional[str], dict]:
+    """(route template, path params) of the route that will handle scope."""
+    from starlette.routing import Match
+    for route in app.router.routes:
+        try:
+            match, child = route.matches(scope)
+        except Exception:
+            continue
+        if match == Match.FULL:
+            return getattr(route, "path", None), dict(child.get("path_params", {}))
+    return None, {}
+
+
+@app.middleware("http")
+async def signed_document_guard(request: Request, call_next):
+    method = request.method.upper()
+    path = request.url.path
+    if method in GUARDED_METHODS and path.startswith("/api/pdf/") and not _allow_break(request):
+        template, params = _match_route(request.scope)
+        if template and signed_guard_classify(method, template) == "guard":
+            doc_id = str(params.get("doc_id", ""))
+            if _UUID_RE.match(doc_id):
+                pdf = UPLOAD_DIR / doc_id / "original.pdf"
+                if pdf.exists():
+                    info = await asyncio.to_thread(advanced_ops.signature_info, pdf)
+                    if info["signed"]:
+                        return _signed_conflict(doc_id, info)
+    return await call_next(request)
+
+
+# CORS must be added AFTER the guard so it wraps it (Starlette: last added is
+# outermost) — otherwise the browser could not read the 409 body.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1404,11 +1526,57 @@ def _execute_intent(doc_id: str, intent: dict, current_page: int) -> dict:
     return {"response": "Something went wrong.", "changed": False}
 
 
+def _capture_doc_state(doc_id: str) -> dict:
+    d = UPLOAD_DIR / doc_id
+    hf = d / "history.json"
+    hdir = d / "history"
+    return {
+        "pdf": (d / "original.pdf").read_bytes(),
+        "history_json": hf.read_bytes() if hf.exists() else None,
+        "history_files": {f.name for f in hdir.iterdir()} if hdir.exists() else set(),
+    }
+
+
+def _revert_if_changed(doc_id: str, state: dict) -> bool:
+    """Restore the PDF + undo history captured by _capture_doc_state.
+
+    Returns True if anything had changed (and was reverted).
+    """
+    d = UPLOAD_DIR / doc_id
+    pdf = d / "original.pdf"
+    if pdf.exists() and pdf.read_bytes() == state["pdf"]:
+        return False
+    tmp = d / f"original.pdf.{uuid.uuid4().hex}.restore"
+    tmp.write_bytes(state["pdf"])
+    os.replace(tmp, pdf)
+    hf = d / "history.json"
+    if state["history_json"] is None:
+        hf.unlink(missing_ok=True)
+    else:
+        hf.write_bytes(state["history_json"])
+    hdir = d / "history"
+    if hdir.exists():
+        for f in hdir.iterdir():
+            if f.name not in state["history_files"]:
+                f.unlink(missing_ok=True)
+    return True
+
+
 @app.post("/api/pdf/{doc_id}/chat")
-async def chat(doc_id: str, msg: ChatMessage):
+async def chat(doc_id: str, msg: ChatMessage, request: Request):
     """Process a natural language chat message and execute PDF commands."""
     _check_ai_rate_limit()
     file_path = get_doc_path(doc_id)
+
+    # Signed-document guard for chat: questions are fine, but if the AI or the
+    # regex fallback EDITS a signed PDF without the user's consent header, the
+    # edit is rolled back and the same 409 the middleware uses is returned.
+    sig_guard_state = None
+    sig_info = None
+    if not _allow_break(request):
+        sig_info = advanced_ops.signature_info(file_path)
+        if sig_info["signed"]:
+            sig_guard_state = _capture_doc_state(doc_id)
     doc = fitz.open(str(file_path))
     page_count = len(doc)
     current_text = doc[msg.current_page].get_text() if msg.current_page < len(doc) else ""
@@ -1481,6 +1649,10 @@ async def chat(doc_id: str, msg: ChatMessage):
         changed = ai_result.get("changed", False)
         page_count_changed = ai_result.get("page_count_changed", False)
 
+    if sig_guard_state is not None and _revert_if_changed(doc_id, sig_guard_state):
+        logger.info("Chat edit on signed document %s reverted (no consent header)", doc_id)
+        return _signed_conflict(doc_id, sig_info)
+
     # Store in chat history
     _chat_histories[doc_id].append({"role": "user", "content": msg.message})
     _chat_histories[doc_id].append({"role": "assistant", "content": response_text, "intent": intent})
@@ -1524,6 +1696,11 @@ async def chat(doc_id: str, msg: ChatMessage):
         )
 
     return result_data
+
+
+# Redaction purge also drops the in-memory chat transcript, which can quote
+# the text that was just redacted.
+advanced_ops.register_purge_hook(lambda _doc_id: _chat_histories.pop(_doc_id, None))
 
 
 @app.post("/api/pdf/{doc_id}/ai/configure")

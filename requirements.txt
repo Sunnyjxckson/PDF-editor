@@ -2,14 +2,19 @@ fastapi>=0.100.0,<1.0.0
 uvicorn>=0.20.0,<1.0.0
 PyMuPDF>=1.27.0,<1.28.0          # feature modules are tested against 1.27.x
 pydantic>=2.0.0,<3.0.0
-anthropic>=0.40.0,<1.0.0
+anthropic>=0.86.0,<1.0.0         # AI agent: output_config effort, server-side fallbacks beta
+httpx>=0.27.0,<1.0.0             # AI agent tools call feature routes in-process (ASGITransport); OCR language install
+python-dotenv>=1.0.0,<2.0.0      # loads backend/.env then repo .env at startup (advanced_ops.load_env_files)
 python-multipart>=0.0.6,<1.0.0
 
 # Feature modules (backend/features/)
 Pillow>=10.0.0,<13.0.0          # objects (image crop/replace), sign (PNG alpha), convert (compress)
 numpy>=1.26.0,<3.0.0            # organize: auto-crop raster scan
 pyhanko>=0.37.0,<0.38.0         # sign: PAdES digital signatures + validation
-cryptography>=42.0.0            # sign: self-signed digital IDs (also pulled in by pyhanko)
+cryptography>=42.0.0,<51.0.0    # sign: self-signed digital IDs, .p12 import, encrypted key at rest
+pyhanko-certvalidator>=0.32.0,<0.33.0  # sign: trust/revocation validation (pulled in by pyhanko; imported directly)
+aiohttp>=3.9.0,<4.0.0           # sign: online OCSP/CRL fetching and RFC 3161 timestamping
+certifi>=2024.0.0               # sign: trust-root fallback when the macOS system roots are unavailable (Linux)
 pdf2docx>=0.5.8,<0.6.0          # convert: PDF -> DOCX (pulls in python-docx, opencv-python-headless)
 python-docx>=1.1.0,<2.0.0       # convert: DOCX -> PDF best-effort path
 openpyxl>=3.1.0,<4.0.0          # convert: PDF tables -> XLSX
@@ -18,4 +23,3 @@ openpyxl>=3.1.0,<4.0.0          # convert: PDF tables -> XLSX
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
-httpx>=0.27.0

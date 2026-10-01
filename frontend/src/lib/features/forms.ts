@@ -10,7 +10,7 @@
  */
 import { create } from "zustand";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, apiFetch } from "../api";
 
 export type FieldType = "text" | "checkbox" | "radio" | "combo" | "list" | "signature" | "button" | "unknown";
 export type CreatableFieldType = "text" | "checkbox" | "radio" | "combo" | "list" | "signature";
@@ -36,6 +36,8 @@ export interface FormField {
   value: FieldValue;
   checked?: boolean; // radio widget: is this button the selected one
   editable?: boolean; // combo
+  multi_select?: boolean; // list box: several selections allowed (value is string[])
+  format?: "date" | null; // text: Acrobat date format actions (mm/dd/yyyy)
 }
 
 export interface FormPageInfo {
@@ -67,18 +69,27 @@ export interface CreateFieldInput {
   multiline?: boolean;
   max_len?: number;
   editable?: boolean;
+  multi_select?: boolean;
+  /** text fields: "date" adds mm/dd/yyyy format actions, "" removes them (update only) */
+  format?: "date" | "";
 }
 
 export type UpdateFieldInput = Partial<Omit<CreateFieldInput, "page" | "type">>;
 
+export type DetectType = "text" | "checkbox" | "radio";
+
 export interface DetectedField {
   page: number;
-  type: "text" | "checkbox";
+  type: DetectType;
   name: string;
   label: string;
-  source: "box" | "glyph" | "underscore" | "line" | "label";
+  /** scan-* sources come from OCR + raster line detection on scanned pages */
+  source: "box" | "glyph" | "underscore" | "line" | "label" | "scan-box" | "scan-line" | "scan-label";
   rect: Rect;
   id?: number;
+  export_value?: string; // radio
+  group?: string; // radio: the shared question label
+  format?: "date";
 }
 
 export interface DetectResponse {
@@ -111,7 +122,7 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
 }
 
 async function request<T>(url: string, init: RequestInit | undefined, fallback: string): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await apiFetch(url, init);
   if (!res.ok) throw new Error(await errorMessage(res, fallback));
   return res.json() as Promise<T>;
 }
@@ -160,7 +171,7 @@ export function flattenForm(docId: string): Promise<{ status: string; flattened:
 
 export function detectFormFields(
   docId: string,
-  opts: { pages?: number[]; dry_run?: boolean; types?: ("text" | "checkbox")[] } = {},
+  opts: { pages?: number[]; dry_run?: boolean; types?: DetectType[] } = {},
 ): Promise<DetectResponse> {
   return request(`${API_BASE}/api/pdf/${docId}/form-fields/detect`, json("POST", opts), "Auto-detect failed");
 }
@@ -269,6 +280,31 @@ export function groupFieldsByName(fields: FormField[]): { name: string; type: Fi
     map.get(key)!.push(f);
   }
   return order.map((name) => ({ name, type: map.get(name)![0].type, widgets: map.get(name)! }));
+}
+
+/** One-line summary of an auto-detect result, e.g. "Created 5 fields (3 text, 1 checkbox, 1 radio group)". */
+export function summarizeDetected(created: DetectedField[]): string {
+  if (created.length === 0) return "No new fields found";
+  const text = created.filter((c) => c.type === "text");
+  const dates = text.filter((c) => c.format === "date").length;
+  const checks = created.filter((c) => c.type === "checkbox").length;
+  const groups = new Set(created.filter((c) => c.type === "radio").map((c) => `${c.page}:${c.name}`)).size;
+  const parts = [`${text.length} text${dates ? ` (${dates} date)` : ""}`, `${checks} checkbox`];
+  if (groups) parts.push(`${groups} radio group${groups === 1 ? "" : "s"}`);
+  const scanned = created.some((c) => String(c.source ?? "").startsWith("scan"));
+  return `Created ${created.length} field${created.length === 1 ? "" : "s"} (${parts.join(", ")})${scanned ? " from the scanned page" : ""}`;
+}
+
+/** ISO yyyy-mm-dd -> mm/dd/yyyy (what date-formatted PDF fields store); other input unchanged. */
+export function toPdfDate(v: string): string {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(v.trim());
+  return m ? `${m[2].padStart(2, "0")}/${m[3].padStart(2, "0")}/${m[1]}` : v;
+}
+
+/** Selected values of a list box field as an array (single or multi-select). */
+export function listSelection(f: FormField): string[] {
+  if (Array.isArray(f.value)) return f.value;
+  return typeof f.value === "string" && f.value ? [f.value] : [];
 }
 
 /** Names of required fields that are still empty. */

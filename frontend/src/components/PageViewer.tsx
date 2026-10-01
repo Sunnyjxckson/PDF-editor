@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState, useEffect, useCallback } from "react";
-import { useEditorStore } from "@/lib/store";
+import { useEditorStore, CSS_PX_PER_PT, computeFitZoom } from "@/lib/store";
 import {
   getPageUrl,
   getTextBlocks,
@@ -29,6 +29,7 @@ import OrganizeMarkupOverlay from "./features/OrganizeMarkupOverlay";
 import FormsOverlay from "./features/FormsOverlay";
 import RedactOverlay from "./features/RedactOverlay";
 import SignOverlay from "./features/SignOverlay";
+import AICitationOverlay from "./features/AICitationOverlay";
 
 const RENDER_DPI = 150;
 const PDF_SCALE = RENDER_DPI / 72;
@@ -46,6 +47,102 @@ interface ContentBlock {
 
 type DragMode = "move" | "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w" | null;
 
+// ─── Double-buffered page image ───────────────────────────────────────────────
+/**
+ * Shows `src` without a blank flash: a new src loads into a hidden back buffer
+ * while the previous (already decoded) image stays on screen; the buffers swap
+ * only once the new one has loaded. Changing `resetKey` (a different page or
+ * document) drops the old image immediately, because showing page 3's pixels
+ * under page 4's overlays would be wrong.
+ */
+export function BufferedPageImage({
+  src,
+  resetKey,
+  alt,
+  imgRef,
+  onShown,
+  onError,
+  className = "max-w-none select-none block",
+}: {
+  src: string;
+  resetKey: string;
+  alt: string;
+  imgRef?: React.MutableRefObject<HTMLImageElement | null>;
+  /** Fired with the visible element after each swap (natural size is known). */
+  onShown?: (img: HTMLImageElement) => void;
+  onError?: () => void;
+  className?: string;
+}) {
+  // two slots; `front` is the one on screen (null until something has loaded)
+  const [slots, setSlots] = useState<[string | null, string | null]>([src || null, null]);
+  const [front, setFront] = useState<0 | 1 | null>(null);
+  const [lastKey, setLastKey] = useState(resetKey);
+  const [lastSrc, setLastSrc] = useState(src);
+  const els = useRef<[HTMLImageElement | null, HTMLImageElement | null]>([null, null]);
+
+  if (resetKey !== lastKey) {
+    setLastKey(resetKey);
+    setLastSrc(src);
+    setSlots([src || null, null]);
+    setFront(null);
+  } else if (src !== lastSrc) {
+    setLastSrc(src);
+    const back: 0 | 1 = front === 0 ? 1 : 0;
+    setSlots((cur) => {
+      const next: [string | null, string | null] = [cur[0], cur[1]];
+      next[back] = src || null;
+      return next;
+    });
+  }
+
+  const backIdx: 0 | 1 = front === 0 ? 1 : 0;
+  const onLoad = (i: 0 | 1) => {
+    if (i !== backIdx || !slots[i]) return; // the front image re-firing load: ignore
+    setFront(i);
+    const other: 0 | 1 = i === 0 ? 1 : 0;
+    setSlots((cur) => {
+      const next: [string | null, string | null] = [cur[0], cur[1]];
+      next[other] = null; // release the old buffer
+      return next;
+    });
+    const el = els.current[i];
+    if (el) {
+      if (imgRef) imgRef.current = el;
+      onShown?.(el);
+    }
+  };
+
+  return (
+    <>
+      {([0, 1] as const).map((i) =>
+        slots[i] ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            key={i}
+            ref={(el) => {
+              els.current[i] = el;
+              if (el && i === front && imgRef) imgRef.current = el;
+            }}
+            src={slots[i]!}
+            alt={i === front ? alt : ""}
+            aria-hidden={i === front ? undefined : true}
+            data-buffer={i === front ? "front" : "back"}
+            className={className}
+            draggable={false}
+            onLoad={() => onLoad(i)}
+            onError={() => i !== front && onError?.()}
+            style={
+              i === front
+                ? { display: "block", width: "100%", height: "auto" }
+                : { position: "absolute", top: 0, left: 0, visibility: "hidden", pointerEvents: "none" }
+            }
+          />
+        ) : null,
+      )}
+    </>
+  );
+}
+
 export default function PageViewer() {
   const {
     docId, currentPage, zoom, pageVersion, activeTool,
@@ -56,6 +153,7 @@ export default function PageViewer() {
     optimisticEdits, addToast,
     regionSelection, setRegionSelection, setChatOpen,
     markupSettings, setActiveTool,
+    zoomMode, setZoomMode, applyFitZoom, zoomIn, zoomOut,
   } = useEditorStore();
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -64,6 +162,7 @@ export default function PageViewer() {
   const imgRef = useRef<HTMLImageElement>(null);
   const [loading, setLoading] = useState(true);
   const [imgSrc, setImgSrc] = useState("");
+  const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
   const [imgSize, setImgSize] = useState({ w: 0, h: 0 });
 
   // Drawing
@@ -130,11 +229,16 @@ export default function PageViewer() {
         const doc = await loadPdfDocument(pdfUrl, docId, pdfVersion);
         if (cancelled) return;
 
+        // Render off-screen, then copy in one synchronous step: the visible
+        // canvas keeps the previous render until the new one is complete.
+        const offscreen = document.createElement("canvas");
+        const { width, height } = await renderPage(doc, currentPage, PDFJS_SCALE, offscreen);
+        if (cancelled) return;
         const canvas = pdfCanvasRef.current;
         if (!canvas) return;
-
-        const { width, height } = await renderPage(doc, currentPage, PDFJS_SCALE, canvas);
-        if (cancelled) return;
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
 
         setImgSize({ w: width, h: height });
         setLoading(false);
@@ -156,12 +260,20 @@ export default function PageViewer() {
   // ─── Reset per-page UI when the page, its version or the render mode changes ──
   // Done during render (React's "adjust state when a prop changes" pattern), so
   // the stale page never paints with the new page's overlays.
-  const viewKey = docId ? `${docId}|${currentPage}|${renderMode}|${renderMode === "pdfjs" ? pdfVersion : pageVersion}` : null;
+  // pageKey = WHICH page is shown; viewKey also includes its version. A new
+  // version of the same page (an edit, undo...) keeps the current render on
+  // screen until the new one has loaded (no blank flash, overlays stay mounted
+  // with their selection); a different page shows the loader instead.
+  const pageKey = docId ? `${docId}|${currentPage}|${renderMode}` : null;
+  const viewKey = docId ? `${pageKey}|${renderMode === "pdfjs" ? pdfVersion : pageVersion}` : null;
   const [lastViewKey, setLastViewKey] = useState<string | null>(null);
+  const [lastPageKey, setLastPageKey] = useState<string | null>(null);
   if (viewKey !== lastViewKey) {
     setLastViewKey(viewKey);
+    const samePage = pageKey === lastPageKey && imgSize.w > 0;
+    setLastPageKey(pageKey);
     if (docId) {
-      setLoading(true);
+      if (!samePage) setLoading(true);
       if (renderMode === "image") setImgSrc(`${getPageUrl(docId, currentPage, RENDER_DPI)}&v=${pageVersion}`);
     }
     setAllPaths([]);
@@ -234,10 +346,55 @@ export default function PageViewer() {
     });
   }, [docId, currentPage, activeTool, pageVersion, fetchTextBlocksCached, renderMode]);
 
-  const handleImageLoad = useCallback(() => {
+  const handleImageShown = useCallback((img: HTMLImageElement) => {
     setLoading(false);
-    if (imgRef.current) setImgSize({ w: imgRef.current.naturalWidth, h: imgRef.current.naturalHeight });
+    setImgSize((cur) =>
+      cur.w === img.naturalWidth && cur.h === img.naturalHeight ? cur : { w: img.naturalWidth, h: img.naturalHeight },
+    );
   }, []);
+
+  // ─── Container size (for fit-width / fit-page) ──────────────────────
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const cs = window.getComputedStyle(el);
+      const padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+      const padY = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+      setContainerSize((cur) => {
+        const w = Math.max(0, el.clientWidth - padX);
+        const h = Math.max(0, el.clientHeight - padY);
+        return cur.w === w && cur.h === h ? cur : { w, h };
+      });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
+    }
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [docId]);
+
+  // ─── Ctrl/Cmd 0 / = / - : actual size, zoom in, zoom out ─────────────
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      if (e.key === "0") {
+        e.preventDefault();
+        useEditorStore.getState().setZoom(1);
+      } else if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        zoomIn();
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        zoomOut();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomIn, zoomOut]);
 
   // ─── Canvas Drawing ──────────────────────────────────────────────────
 
@@ -294,6 +451,8 @@ export default function PageViewer() {
 
   // ─── Current scale factor based on render mode ──────────────────────
   const currentScale = renderMode === "pdfjs" ? PDFJS_SCALE : PDF_SCALE;
+  // CSS px per rendered px: zoom 1 = true size (72pt = 96 CSS px), whatever the render DPI
+  const displayScale = (zoom * CSS_PX_PER_PT) / currentScale;
 
   // ─── Mouse Handlers (draw/highlight/eraser) ──────────────────────────
 
@@ -389,7 +548,7 @@ export default function PageViewer() {
     const wrapper = renderMode === "pdfjs" ? pdfCanvasRef.current?.parentElement : imgRef.current?.parentElement;
     if (!wrapper) return { x: 0, y: 0 };
     const wrapperRect = wrapper.getBoundingClientRect();
-    return { x: (e.clientX - wrapperRect.left) / zoom, y: (e.clientY - wrapperRect.top) / zoom };
+    return { x: (e.clientX - wrapperRect.left) / displayScale, y: (e.clientY - wrapperRect.top) / displayScale };
   };
 
   const handleSelectMouseDown = (e: React.MouseEvent, block: ContentBlock) => {
@@ -462,7 +621,7 @@ export default function PageViewer() {
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
     };
-  }, [dragMode, dragStart, dragRect, originalRect, zoom, renderMode]);
+  }, [dragMode, dragStart, dragRect, originalRect, zoom, renderMode, displayScale]);
 
   const commitMoveResize = async () => {
     if (!docId || !selectedBlock || !dragRect) {
@@ -609,13 +768,20 @@ export default function PageViewer() {
     }
   };
 
-  if (!docId) return null;
-
   // Visible page size in PDF points (/info is rotation-applied). Fall back to
   // the rendered size if /info is stale for a moment after a page operation.
   const pageInfo = docInfo?.pages[currentPage];
   const pageWidthPt = pageInfo?.width ?? imgSize.w / currentScale;
   const pageHeightPt = pageInfo?.height ?? imgSize.h / currentScale;
+
+  // ─── Fit width / fit page ───────────────────────────────────────────
+  useEffect(() => {
+    if (zoomMode === "custom" || !pageWidthPt || !pageHeightPt || !containerSize.w) return;
+    applyFitZoom(computeFitZoom(zoomMode, pageWidthPt, pageHeightPt, containerSize.w, containerSize.h));
+  }, [zoomMode, pageWidthPt, pageHeightPt, containerSize, applyFitZoom]);
+  void setZoomMode; // (set from the toolbar; kept here so fit mode survives re-renders)
+
+  if (!docId) return null;
   const overlayReady = !loading && imgSize.w > 0;
   const notify = (message: string, type?: "success" | "error" | "info") => addToast(message, type ?? "info");
 
@@ -657,9 +823,29 @@ export default function PageViewer() {
         </button>
       </div>
 
+      {/* Sizer: occupies the ZOOMED size in layout, so the scroll area is exact
+          and a page wider than the viewport scrolls from its left edge
+          (justify-center-safe). The page inside keeps its rendered-pixel
+          coordinate space and is scaled from the top-left corner. */}
       <div
-        className="relative shadow-xl rounded-sm bg-white"
-        style={{ transform: `scale(${zoom})`, transformOrigin: "top center", cursor: getCursor() }}
+        data-testid="page-sizer"
+        className="shrink-0 relative"
+        style={
+          imgSize.w > 0
+            ? { width: imgSize.w * displayScale, height: imgSize.h * displayScale }
+            : { minWidth: 300, minHeight: 400 }
+        }
+      >
+      <div
+        data-testid="page-surface"
+        className="absolute top-0 left-0 shadow-xl rounded-sm bg-white"
+        style={{
+          width: imgSize.w || undefined,
+          height: imgSize.h || undefined,
+          transform: `scale(${displayScale})`,
+          transformOrigin: "top left",
+          cursor: getCursor(),
+        }}
         onMouseDown={handleSelectGlobalMouseDown}
       >
         {loading && (
@@ -670,8 +856,14 @@ export default function PageViewer() {
 
         {/* Image-based rendering */}
         {renderMode === "image" && imgSrc && (
-          <img ref={imgRef} src={imgSrc} alt={`Page ${currentPage + 1}`} className="max-w-none select-none block"
-            onLoad={handleImageLoad} draggable={false} style={{ display: loading ? "none" : "block" }} />
+          <BufferedPageImage
+            src={imgSrc}
+            resetKey={pageKey ?? ""}
+            alt={`Page ${currentPage + 1}`}
+            imgRef={imgRef}
+            onShown={handleImageShown}
+            onError={() => setLoading(false)}
+          />
         )}
 
         {/* PDF.js canvas rendering */}
@@ -679,7 +871,7 @@ export default function PageViewer() {
           <canvas
             ref={pdfCanvasRef}
             className="max-w-none select-none block"
-            style={{ display: loading ? "none" : "block" }}
+            style={{ display: loading && imgSize.w === 0 ? "none" : "block" }}
           />
         )}
 
@@ -745,6 +937,9 @@ export default function PageViewer() {
         )}
         {overlayReady && activeTool === "sign" && (
           <SignOverlay pageIndex={currentPage} pageWidthPt={pageWidthPt} pageHeightPt={pageHeightPt} />
+        )}
+        {overlayReady && (
+          <AICitationOverlay currentPage={currentPage} pageWidth={pageWidthPt} pageHeight={pageHeightPt} />
         )}
 
         {/* Optimistic text overlays */}
@@ -920,6 +1115,7 @@ export default function PageViewer() {
             </div>
           </div>
         )}
+      </div>
       </div>
     </div>
   );

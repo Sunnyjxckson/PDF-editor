@@ -1,4 +1,154 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// ─── Signed-document guard (shared fetch path) ──────────────────────────────
+//
+// The backend answers any edit of a digitally signed PDF with
+// 409 {"code":"signed_document"}. apiFetch() asks the user (via the handler a
+// <SignedDocGuard/> registers) and retries with X-Allow-Break-Signature: 1 on
+// Continue. installSignedDocFetchGuard() routes the feature clients' plain
+// fetch() calls through the same logic.
+
+export const ALLOW_BREAK_SIGNATURE_HEADER = "X-Allow-Break-Signature";
+
+export type SignedDocChoice = "continue" | "copy" | "cancel";
+
+export interface SignedDocConflict {
+  docId: string;
+  detail: string;
+  signers: string[];
+}
+
+type ConfirmHandler = (info: SignedDocConflict) => Promise<SignedDocChoice>;
+
+let confirmHandler: ConfirmHandler | null = null;
+let nativeFetch: typeof fetch | null = null;
+// Once the user has accepted breaking a document's signature, later edits in
+// this session go straight through (the signature is already invalid).
+const consentedDocs = new Set<string>();
+const pendingPrompts = new Map<string, Promise<SignedDocChoice>>();
+
+const DOC_ID_IN_URL = /\/api\/pdf\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i;
+
+export function setSignedDocConfirmHandler(fn: ConfirmHandler | null): () => void {
+  confirmHandler = fn;
+  return () => {
+    if (confirmHandler === fn) confirmHandler = null;
+  };
+}
+
+export function hasSignatureConsent(docId: string): boolean {
+  return consentedDocs.has(docId);
+}
+
+export function clearSignatureConsent(docId?: string): void {
+  if (docId) consentedDocs.delete(docId);
+  else consentedDocs.clear();
+}
+
+function baseFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const f = nativeFetch ?? globalThis.fetch;
+  // Keep the exact call shape (no trailing undefined) callers/tests expect.
+  return init === undefined ? f(input) : f(input, init);
+}
+
+function urlOf(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  return (input as Request).url;
+}
+
+function methodOf(input: RequestInfo | URL, init?: RequestInit): string {
+  if (init?.method) return init.method.toUpperCase();
+  if (typeof Request !== "undefined" && input instanceof Request) return input.method.toUpperCase();
+  return "GET";
+}
+
+function withAllowHeader(input: RequestInfo | URL, init?: RequestInit): RequestInit {
+  const base = init?.headers ?? (typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined);
+  const headers = new Headers(base);
+  headers.set(ALLOW_BREAK_SIGNATURE_HEADER, "1");
+  return { ...init, headers };
+}
+
+async function readSignedConflict(res: Response, docId: string): Promise<SignedDocConflict | null> {
+  if (!res || res.status !== 409 || typeof res.clone !== "function") return null;
+  try {
+    const body = await res.clone().json();
+    if (!body || body.code !== "signed_document") return null;
+    return {
+      docId: typeof body.doc_id === "string" ? body.doc_id : docId,
+      detail: typeof body.detail === "string" ? body.detail : "This PDF is digitally signed.",
+      signers: Array.isArray(body.signers) ? body.signers.filter((x: unknown) => typeof x === "string") : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Download the stored (still validly signed) PDF before it gets modified. */
+export async function saveSignedCopy(docId: string): Promise<void> {
+  const res = await baseFetch(`${API_BASE}/api/pdf/${docId}/export?flatten=false`);
+  if (!res.ok) throw new Error("Could not save a copy of the signed PDF");
+  const blob = await res.blob();
+  if (typeof document === "undefined" || typeof URL.createObjectURL !== "function") return;
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = "signed-original.pdf";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 10_000);
+}
+
+function askOnce(info: SignedDocConflict): Promise<SignedDocChoice> {
+  // Several requests can hit the 409 at once (e.g. a batch); ask only once.
+  const existing = pendingPrompts.get(info.docId);
+  if (existing) return existing;
+  const p = (confirmHandler as ConfirmHandler)(info).finally(() => pendingPrompts.delete(info.docId));
+  pendingPrompts.set(info.docId, p);
+  return p;
+}
+
+/**
+ * fetch() with the signed-document confirm-and-retry flow. Behaves exactly
+ * like fetch for everything else; on Cancel the original 409 response is
+ * returned so callers surface its `detail` like any other error.
+ */
+export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const url = urlOf(input);
+  const m = url.startsWith(API_BASE) || url.startsWith("/api/") ? DOC_ID_IN_URL.exec(url) : null;
+  const docId = m ? m[1].toLowerCase() : null;
+  const method = methodOf(input, init);
+  const mutating = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  if (!docId || !mutating) return baseFetch(input, init);
+
+  if (consentedDocs.has(docId)) return baseFetch(input, withAllowHeader(input, init));
+
+  // A Request body can be read only once; keep a copy for the retry.
+  const retryInput = typeof Request !== "undefined" && input instanceof Request ? input.clone() : input;
+  const res = await baseFetch(input, init);
+  const conflict = await readSignedConflict(res, docId);
+  if (!conflict || !confirmHandler) return res;
+
+  const choice = await askOnce(conflict);
+  if (choice === "cancel") return res;
+  if (choice === "copy") await saveSignedCopy(docId);
+  consentedDocs.add(docId);
+  return baseFetch(retryInput, withAllowHeader(retryInput, init));
+}
+
+/** Route every global fetch() (feature clients included) through apiFetch. */
+export function installSignedDocFetchGuard(): () => void {
+  if (nativeFetch) return () => {};
+  nativeFetch = globalThis.fetch.bind(globalThis);
+  const original = globalThis.fetch;
+  globalThis.fetch = apiFetch as typeof fetch;
+  return () => {
+    if (globalThis.fetch === (apiFetch as typeof fetch)) globalThis.fetch = original;
+    nativeFetch = null;
+  };
+}
 
 export interface PDFDocument {
   id: string;
@@ -48,7 +198,7 @@ export interface FindResult {
 export async function uploadPDF(file: File): Promise<PDFDocument> {
   const formData = new FormData();
   formData.append("file", file);
-  const res = await fetch(`${API_BASE}/api/pdf/upload`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/upload`, {
     method: "POST",
     body: formData,
   });
@@ -57,7 +207,7 @@ export async function uploadPDF(file: File): Promise<PDFDocument> {
 }
 
 export async function getDocumentInfo(docId: string): Promise<DocumentInfo> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/info`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/info`);
   if (!res.ok) throw new Error("Failed to get document info");
   return res.json();
 }
@@ -78,7 +228,7 @@ export async function getTextBlocks(docId: string, pageNum?: number): Promise<Te
   const url = pageNum !== undefined
     ? `${API_BASE}/api/pdf/${docId}/text?page_num=${pageNum}`
     : `${API_BASE}/api/pdf/${docId}/text`;
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   if (!res.ok) throw new Error("Failed to get text");
   return res.json();
 }
@@ -90,7 +240,7 @@ export async function editText(docId: string, data: {
   font_size?: number;
   color?: number[];
 }) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/text/edit`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/text/edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -107,7 +257,7 @@ export async function addText(docId: string, data: {
   font_size?: number;
   color?: number[];
 }) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/text/add`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/text/add`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -123,7 +273,7 @@ export async function moveResizeContent(docId: string, data: {
   old_bbox: number[];
   new_bbox: number[];
 }) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/text/move`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/text/move`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -135,7 +285,7 @@ export async function moveResizeContent(docId: string, data: {
 // ─── Find & Replace ───────────────────────────────────────────────────────
 
 export async function findText(docId: string, findStr: string, page?: number, matchCase = false): Promise<FindResult> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/find`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/find`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ find_text: findStr, page, match_case: matchCase }),
@@ -145,7 +295,7 @@ export async function findText(docId: string, findStr: string, page?: number, ma
 }
 
 export async function replaceText(docId: string, findStr: string, replaceStr: string, page?: number) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/replace`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/replace`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ find_text: findStr, replace_text: replaceStr, page }),
@@ -157,7 +307,7 @@ export async function replaceText(docId: string, findStr: string, replaceStr: st
 // ─── Highlights & Drawing ─────────────────────────────────────────────────
 
 export async function addHighlight(docId: string, page: number, rects: number[][], color?: number[], opacity?: number) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/highlight`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/highlight`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page, rects, color, opacity }),
@@ -167,7 +317,7 @@ export async function addHighlight(docId: string, page: number, rects: number[][
 }
 
 export async function addDrawing(docId: string, page: number, paths: { points: number[][]; color: number[]; width: number }[]) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/draw`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/draw`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page, paths }),
@@ -179,13 +329,13 @@ export async function addDrawing(docId: string, page: number, paths: { points: n
 // ─── Annotations (Fabric.js JSON) ─────────────────────────────────────────
 
 export async function getAnnotations(docId: string, pageNum: number): Promise<unknown[]> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/annotations/${pageNum}`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/annotations/${pageNum}`);
   if (!res.ok) throw new Error("Failed to get annotations");
   return res.json();
 }
 
 export async function saveAnnotations(docId: string, pageNum: number, data: unknown[]) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/annotations/${pageNum}`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/annotations/${pageNum}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -197,7 +347,7 @@ export async function saveAnnotations(docId: string, pageNum: number, data: unkn
 // ─── Page Operations ──────────────────────────────────────────────────────
 
 export async function rotatePage(docId: string, pageNum: number, rotation: number) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/edit`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/edit`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page: pageNum, type: "rotate", rotation }),
@@ -207,7 +357,7 @@ export async function rotatePage(docId: string, pageNum: number, rotation: numbe
 }
 
 export async function deletePage(docId: string, pageNum: number) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/edit`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/edit`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page: pageNum, type: "delete" }),
@@ -217,7 +367,7 @@ export async function deletePage(docId: string, pageNum: number) {
 }
 
 export async function reorderPages(docId: string, pageOrder: number[]) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/reorder`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/reorder`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page_order: pageOrder }),
@@ -227,7 +377,7 @@ export async function reorderPages(docId: string, pageOrder: number[]) {
 }
 
 export async function splitPDF(docId: string, pageRanges: number[][]) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/split`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/split`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page_ranges: pageRanges }),
@@ -253,7 +403,7 @@ export async function aiAssist(docId: string, data: {
   selected_text?: string;
   prompt?: string;
 }): Promise<{ result: unknown; action: string }> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/ai/assist`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/ai/assist`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
@@ -272,7 +422,7 @@ export interface ChatResponse {
 }
 
 export async function sendChatMessage(docId: string, message: string, currentPage: number): Promise<ChatResponse> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/chat`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, current_page: currentPage }),
@@ -317,7 +467,7 @@ export function streamChatMessage(
           height: Math.round(region.rect.height),
         };
       }
-      const res = await fetch(`${API_BASE}/api/pdf/${docId}/chat`, {
+      const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -327,7 +477,14 @@ export function streamChatMessage(
       if (!res.ok) {
         // Fall back to non-streaming if server doesn't support it
         const errorText = await res.text();
-        throw new Error(errorText || "Chat failed");
+        let message = errorText;
+        try {
+          const parsed = JSON.parse(errorText);
+          if (parsed && typeof parsed.detail === "string") message = parsed.detail;
+        } catch {
+          // not JSON
+        }
+        throw new Error(message || "Chat failed");
       }
 
       const contentType = res.headers.get("content-type") || "";
@@ -396,7 +553,7 @@ export function streamChatMessage(
 }
 
 export async function getChatHistory(docId: string): Promise<{ role: string; content: string }[]> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/chat/history`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/chat/history`);
   if (!res.ok) throw new Error("Failed to get chat history");
   return res.json();
 }
@@ -428,7 +585,7 @@ async function errorDetail(res: Response, fallback: string): Promise<Error> {
 }
 
 async function postJson<T>(path: string, body: unknown, fallback: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await apiFetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -438,7 +595,7 @@ async function postJson<T>(path: string, body: unknown, fallback: string): Promi
 }
 
 export async function getHistory(docId: string): Promise<HistoryState> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/history`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/history`);
   if (!res.ok) throw await errorDetail(res, "Could not load history");
   return res.json();
 }
@@ -490,5 +647,5 @@ export function compareDocuments(docId1: string, docId2: string) {
 }
 
 export async function deleteDocument(docId: string) {
-  await fetch(`${API_BASE}/api/pdf/${docId}`, { method: "DELETE" });
+  await apiFetch(`${API_BASE}/api/pdf/${docId}`, { method: "DELETE" });
 }

@@ -28,7 +28,10 @@ import {
   detectScannedPages,
   exportDocument,
   formatBytes,
-  getOcrLanguages,
+  getConvertCapabilities,
+  getOcrLanguageInfo,
+  installOcrLanguage,
+  joinOcrLanguages,
   runOcr,
   saveBlob,
   type CompressPreset,
@@ -36,6 +39,7 @@ import {
   type CreatePageSize,
   type CreatedDocument,
   type ExportFormat,
+  type HtmlLayout,
   type OcrDetectResult,
   type OcrJob,
   type OcrMode,
@@ -56,15 +60,16 @@ export interface ConvertPanelProps {
 
 type OcrScope = "auto" | "current" | "all";
 
-const EXPORTS: { fmt: ExportFormat; label: string; icon: typeof FileText; hint: string }[] = [
-  { fmt: "docx", label: "Word", icon: FileType, hint: "DOCX with layout, tables, images" },
-  { fmt: "xlsx", label: "Excel", icon: FileSpreadsheet, hint: "Detected tables, one sheet each" },
-  { fmt: "md", label: "Markdown", icon: Hash, hint: "Headings, lists, tables" },
-  { fmt: "html", label: "HTML", icon: FileCode, hint: "Positioned web page" },
-  { fmt: "txt", label: "Text", icon: FileText, hint: "Plain text, pages split by form feed" },
-  { fmt: "csv", label: "CSV", icon: FileSpreadsheet, hint: "Tables as CSV files (zip)" },
-  { fmt: "png", label: "PNG", icon: ImageIcon, hint: "One image per page (zip)" },
-  { fmt: "jpg", label: "JPG", icon: ImageIcon, hint: "One image per page (zip)" },
+const EXPORTS: { key: string; fmt: ExportFormat; layout?: HtmlLayout; label: string; icon: typeof FileText; hint: string }[] = [
+  { key: "docx", fmt: "docx", label: "Word", icon: FileType, hint: "DOCX with layout, tables, images" },
+  { key: "xlsx", fmt: "xlsx", label: "Excel", icon: FileSpreadsheet, hint: "Detected tables, one sheet each" },
+  { key: "md", fmt: "md", label: "Markdown", icon: Hash, hint: "Headings, lists, tables" },
+  { key: "html", fmt: "html", layout: "positioned", label: "HTML", icon: FileCode, hint: "Positioned web page that looks like the PDF" },
+  { key: "html-reflow", fmt: "html", layout: "reflow", label: "Web page", icon: FileCode, hint: "Reflowable HTML: headings, paragraphs, lists, tables, embedded images" },
+  { key: "txt", fmt: "txt", label: "Text", icon: FileText, hint: "Plain text, pages split by form feed" },
+  { key: "csv", fmt: "csv", label: "CSV", icon: FileSpreadsheet, hint: "Tables as CSV files (zip)" },
+  { key: "png", fmt: "png", label: "PNG", icon: ImageIcon, hint: "One image per page (zip)" },
+  { key: "jpg", fmt: "jpg", label: "JPG", icon: ImageIcon, hint: "One image per page (zip)" },
 ];
 
 const PRESETS: { id: CompressPreset; label: string; desc: string }[] = [
@@ -107,7 +112,15 @@ export default function ConvertPanel({
 }: ConvertPanelProps) {
   // ── OCR state
   const [languages, setLanguages] = useState<string[]>(["eng"]);
+  const [langNames, setLangNames] = useState<Record<string, string>>({});
+  const [installable, setInstallable] = useState<{ code: string; name: string }[]>([]);
   const [language, setLanguage] = useState("eng");
+  const [language2, setLanguage2] = useState("");
+  const [installCode, setInstallCode] = useState("");
+  const [installing, setInstalling] = useState(false);
+  const [installMsg, setInstallMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [wordAvailable, setWordAvailable] = useState(false);
+  const [useWord, setUseWord] = useState(false);
   const [ocrMode, setOcrMode] = useState<OcrMode>("searchable");
   const [scope, setScope] = useState<OcrScope>("auto");
   const [detect, setDetect] = useState<OcrDetectResult | null>(null);
@@ -116,7 +129,7 @@ export default function ConvertPanel({
   const [ocrMsg, setOcrMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
   // ── Export state
-  const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  const [exporting, setExporting] = useState<string | null>(null);
   const [imageDpi, setImageDpi] = useState(150);
   const [exportMsg, setExportMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
@@ -145,16 +158,51 @@ export default function ConvertPanel({
     }
   }, [docId]);
 
+  const applyLanguageInfo = useCallback(
+    (info: { languages: string[]; installable?: { code: string; name: string }[]; names?: Record<string, string> }) => {
+      const l = info.languages;
+      if (l.length) {
+        setLanguages(l);
+        setLanguage((cur) => (l.includes(cur) ? cur : l.includes("eng") ? "eng" : l[0]));
+        setLanguage2((cur) => (cur && l.includes(cur) ? cur : ""));
+      }
+      if (info.installable) {
+        setInstallable(info.installable);
+        setInstallCode((cur) => (info.installable!.some((x) => x.code === cur) ? cur : ""));
+      }
+      if (info.names) setLangNames(info.names);
+    },
+    [],
+  );
+
   useEffect(() => {
-    getOcrLanguages()
-      .then((l) => {
-        if (l.length) {
-          setLanguages(l);
-          setLanguage((cur) => (l.includes(cur) ? cur : l[0]));
-        }
-      })
-      .catch(() => undefined);
-  }, []);
+    getOcrLanguageInfo().then(applyLanguageInfo).catch(() => undefined);
+    getConvertCapabilities()
+      .then((c) => setWordAvailable(!!c.word))
+      .catch(() => setWordAvailable(false));
+  }, [applyLanguageInfo]);
+
+  const handleInstall = async () => {
+    if (!installCode) return;
+    setInstalling(true);
+    setInstallMsg(null);
+    const name = installable.find((x) => x.code === installCode)?.name ?? installCode;
+    try {
+      const res = await installOcrLanguage(installCode);
+      applyLanguageInfo(await getOcrLanguageInfo().catch(() => ({ languages: res.languages })));
+      setLanguage2(installCode);
+      setInstallMsg({
+        kind: "ok",
+        text: res.already_installed ? `${name} was already installed.` : `Installed ${name} (${installCode}).`,
+      });
+    } catch (e) {
+      setInstallMsg({ kind: "err", text: e instanceof Error ? e.message : "Install failed" });
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const langLabel = (code: string) => (langNames[code] && langNames[code] !== code ? `${langNames[code]} (${code})` : code);
 
   useEffect(() => {
     refreshDetect();
@@ -175,7 +223,7 @@ export default function ConvertPanel({
       const pages = scope === "current" ? [currentPage] : scope === "all" ? detect?.pages.map((p) => p.page) ?? null : null;
       const res = await runOcr(
         docId,
-        { language, mode: ocrMode, pages, force: scope !== "auto" },
+        { language: joinOcrLanguages([language, language2]), mode: ocrMode, pages, force: scope !== "auto" },
         setOcrJob,
         500,
         ctl.signal,
@@ -199,13 +247,14 @@ export default function ConvertPanel({
     }
   };
 
-  const handleExport = async (fmt: ExportFormat) => {
-    setExporting(fmt);
+  const handleExport = async (key: string, fmt: ExportFormat, layout?: HtmlLayout) => {
+    setExporting(key);
     setExportMsg(null);
     try {
       const { blob, filename: name } = await exportDocument(docId, fmt, {
         dpi: fmt === "png" || fmt === "jpg" ? imageDpi : undefined,
-        filename: baseName,
+        filename: layout === "reflow" ? `${baseName}-reflow` : baseName,
+        layout,
       });
       saveBlob(blob, name);
       setExportMsg({ kind: "ok", text: `Downloaded ${name} (${formatBytes(blob.size)})` });
@@ -236,7 +285,11 @@ export default function ConvertPanel({
     setCreating(true);
     setCreateMsg(null);
     try {
-      const doc = await createPdfFromFiles(files, { pageSize });
+      const hasDocx = files.some((f) => /\.docx$/i.test(f.name));
+      const doc = await createPdfFromFiles(files, {
+        pageSize,
+        docxEngine: useWord && wordAvailable && hasDocx ? "word" : "builtin",
+      });
       setCreateMsg({ kind: "ok", text: `Created ${doc.filename} (${doc.page_count} page${doc.page_count === 1 ? "" : "s"})` });
       setFiles([]);
       onDocumentCreated?.(doc);
@@ -302,13 +355,28 @@ export default function ConvertPanel({
             </select>
           </label>
           <label className="block">
+            <span className={labelCls}>Also recognize</span>
+            <select
+              aria-label="Second OCR language"
+              className={selectCls}
+              value={language2}
+              onChange={(e) => setLanguage2(e.target.value)}
+              disabled={ocrBusy || languages.length < 2}
+            >
+              <option value="">None</option>
+              {languages.filter((l) => l !== language).map((l) => (
+                <option key={l} value={l}>+ {langLabel(l)}</option>
+              ))}
+            </select>
+          </label>
+          <label className="block">
             <span className={labelCls}>Output</span>
             <select aria-label="OCR output" className={selectCls} value={ocrMode} onChange={(e) => setOcrMode(e.target.value as OcrMode)} disabled={ocrBusy}>
               <option value="searchable">Searchable image</option>
               <option value="editable">Editable text</option>
             </select>
           </label>
-          <label className="block col-span-2">
+          <label className="block">
             <span className={labelCls}>Pages</span>
             <select aria-label="OCR pages" className={selectCls} value={scope} onChange={(e) => setScope(e.target.value as OcrScope)} disabled={ocrBusy}>
               <option value="auto">Pages that need it</option>
@@ -317,6 +385,11 @@ export default function ConvertPanel({
             </select>
           </label>
         </div>
+        {ocrMode === "editable" && (
+          <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1" data-testid="ocr-editable-hint">
+            Removes the scanned letters from the page image and replaces them with real text you can change with Edit Text.
+          </p>
+        )}
         <button className={`${primaryBtn} w-full mt-2`} onClick={handleOcr} disabled={ocrBusy}>
           {ocrBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ScanText className="w-4 h-4" />}
           {ocrBusy ? "Recognizing…" : "Recognize text"}
@@ -332,6 +405,33 @@ export default function ConvertPanel({
           </div>
         )}
         {ocrMsg && <Message kind={ocrMsg.kind} text={ocrMsg.text} />}
+        {installable.length > 0 && (
+          <details className="mt-2 text-xs" data-testid="ocr-install">
+            <summary className="cursor-pointer text-gray-600 dark:text-gray-300">Add a language…</summary>
+            <div className="flex items-center gap-2 mt-1.5">
+              <select
+                aria-label="Language to install"
+                className={selectCls}
+                value={installCode}
+                onChange={(e) => setInstallCode(e.target.value)}
+                disabled={installing}
+              >
+                <option value="">Choose a language</option>
+                {installable.map((l) => (
+                  <option key={l.code} value={l.code}>{l.name} ({l.code})</option>
+                ))}
+              </select>
+              <button className={secondaryBtn} onClick={handleInstall} disabled={installing || !installCode}>
+                {installing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                Install
+              </button>
+            </div>
+            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
+              Downloads the language model (about 1–4 MB) from github.com/tesseract-ocr/tessdata_fast to the server.
+            </p>
+            {installMsg && <Message kind={installMsg.kind} text={installMsg.text} />}
+          </details>
+        )}
       </section>
 
       {/* ── Export ──────────────────────────────────────────── */}
@@ -341,15 +441,16 @@ export default function ConvertPanel({
           <h4 id="convert-export" className="text-sm font-medium">Export to</h4>
         </div>
         <div className="grid grid-cols-4 gap-1.5">
-          {EXPORTS.map(({ fmt, label, icon: Icon, hint }) => (
+          {EXPORTS.map(({ key, fmt, layout, label, icon: Icon, hint }) => (
             <button
-              key={fmt}
+              key={key}
               title={hint}
-              onClick={() => handleExport(fmt)}
+              aria-label={`Export ${label}`}
+              onClick={() => handleExport(key, fmt, layout)}
               disabled={exporting !== null}
               className="flex flex-col items-center gap-1 p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 text-xs"
             >
-              {exporting === fmt ? <Loader2 className="w-4 h-4 animate-spin" /> : <Icon className="w-4 h-4" />}
+              {exporting === key ? <Loader2 className="w-4 h-4 animate-spin" /> : <Icon className="w-4 h-4" />}
               {label}
             </button>
           ))}
@@ -421,6 +522,12 @@ export default function ConvertPanel({
               </li>
             ))}
           </ul>
+        )}
+        {wordAvailable && files.some((f) => /\.docx$/i.test(f.name)) && (
+          <label className="flex items-center gap-2 mt-2 text-xs">
+            <input type="checkbox" checked={useWord} onChange={(e) => setUseWord(e.target.checked)} />
+            <span>High fidelity (uses Microsoft Word)</span>
+          </label>
         )}
         <div className="flex items-center gap-2 mt-2">
           <select aria-label="Page size" className={selectCls} value={pageSize} onChange={(e) => setPageSize(e.target.value as CreatePageSize)}>

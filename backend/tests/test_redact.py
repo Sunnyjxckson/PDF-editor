@@ -263,17 +263,21 @@ async def test_rotated_page_uses_visible_coordinates(rc, upload_dir):
     d.close()
 
 
-async def test_undo_restores_after_apply(rc, upload_dir):
+async def test_apply_is_not_undoable_and_purges_snapshots(rc, upload_dir):
+    # Redaction is irreversible by design: undo must NOT bring the secret back,
+    # and no history snapshot may keep an unredacted copy on disk.
     doc_id = store(upload_dir, sample_doc())
     await rc.post(f"/api/pdf/{doc_id}/redact/apply", json={"areas": [{"page": 0, "rect": [60, 115, 300, 135]}]})
     d = reopen(upload_dir, doc_id)
     assert SECRET not in d[0].get_text()
     d.close()
     r = await rc.post(f"/api/pdf/{doc_id}/undo")
-    assert r.status_code == 200, r.text
+    assert r.status_code == 400, r.text
     d = reopen(upload_dir, doc_id)
-    assert SECRET in d[0].get_text()
+    assert SECRET not in d[0].get_text()
     d.close()
+    hdir = upload_dir / doc_id / "history"
+    assert not hdir.exists() or not any(hdir.iterdir())
 
 
 # ─── search & redact ─────────────────────────────────────────────────────────

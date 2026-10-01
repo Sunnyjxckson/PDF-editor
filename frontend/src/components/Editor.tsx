@@ -15,6 +15,7 @@ import FindReplace from "./FindReplace";
 import ChatPanel from "./ChatPanel";
 import AIPanel from "./AIPanel";
 import Toasts from "./Toasts";
+import SignedDocGuard from "./SignedDocGuard";
 import KeyboardShortcuts from "./KeyboardShortcuts";
 import OrganizeView from "./features/OrganizeView";
 import OrganizeHeaderFooterDialog from "./features/OrganizeHeaderFooterDialog";
@@ -39,7 +40,6 @@ export default function Editor() {
   const setCurrentPage = useEditorStore((s) => s.setCurrentPage);
   const currentPage = useEditorStore((s) => s.currentPage);
   const totalPages = useEditorStore((s) => s.totalPages);
-  const zoom = useEditorStore((s) => s.zoom);
   const setZoom = useEditorStore((s) => s.setZoom);
   const chatPinned = useEditorStore((s) => s.chatPinned);
   const chatOpen = useEditorStore((s) => s.chatOpen);
@@ -127,11 +127,11 @@ export default function Editor() {
         case "+":
         case "=":
           e.preventDefault();
-          setZoom(zoom + 0.25);
+          useEditorStore.getState().zoomIn();
           break;
         case "-":
           e.preventDefault();
-          setZoom(zoom - 0.25);
+          useEditorStore.getState().zoomOut();
           break;
         case "0":
           e.preventDefault();
@@ -141,7 +141,7 @@ export default function Editor() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [toggleChat, setFindReplaceOpen, findReplaceOpen, setShortcutsOpen, toggleSidebar, setActiveTool, togglePanel, setOrganizeOpen, organizeOpen, setCurrentPage, currentPage, totalPages, zoom, setZoom]);
+  }, [toggleChat, setFindReplaceOpen, findReplaceOpen, setShortcutsOpen, toggleSidebar, setActiveTool, togglePanel, setOrganizeOpen, organizeOpen, setCurrentPage, currentPage, totalPages, setZoom]);
 
   const changed = () => { void reloadDocument(); };
   const firstPage = docInfo?.pages[0];
@@ -194,6 +194,7 @@ export default function Editor() {
         />
       )}
       <Toasts />
+      <SignedDocGuard />
       <KeyboardShortcuts />
     </div>
   );

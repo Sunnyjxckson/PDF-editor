@@ -61,6 +61,11 @@ FF_NOTOGGLETOOFF = 16384
 FF_RADIO = 32768
 FF_COMBO = 131072
 FF_EDIT = 262144
+FF_MULTISELECT = 2097152
+
+# Acrobat's standard date format actions (AFDate_* live in every viewer's
+# built-in JavaScript), used for fields auto-detected next to "Date"/"DOB".
+DATE_FORMAT = "mm/dd/yyyy"
 
 TYPE_NAMES = {
     fitz.PDF_WIDGET_TYPE_BUTTON: "button",
@@ -281,10 +286,118 @@ def _norm_options(values) -> tuple[list[str], list[str]]:
     return opts, labels
 
 
+def _choice_values_raw(doc: fitz.Document, w: fitz.Widget) -> list[str]:
+    """Selected value(s) of a choice field read from /V (string or array).
+
+    PyMuPDF reports an array /V (multi-select list box) as ''."""
+    holder = _field_holder(doc, w)
+    typ, val = doc.xref_get_key(holder, "V")
+    if typ == "string":
+        return [val] if val else []
+    if typ == "array":
+        out, i = [], 0
+        val = val.strip()[1:-1]
+        while i < len(val):
+            if val[i] in "(<":
+                t, i = _parse_pdf_string_at(val, i)
+                out.append(t)
+            else:
+                i += 1
+        return out
+    if typ == "name" and val not in ("/Off", ""):
+        return [val[1:]]
+    return []
+
+
+def _field_format(doc: fitz.Document, w: fitz.Widget) -> Optional[str]:
+    try:
+        holder = _field_holder(doc, w)
+        for x in (holder, w.xref):
+            typ, js = doc.xref_get_key(x, "AA/F/JS")
+            if typ == "string" and "AFDate_" in js:
+                return "date"
+    except Exception:
+        pass
+    return None
+
+
+def _set_date_format(doc: fitz.Document, xref: int, fmt: str = DATE_FORMAT):
+    k = _pdf_str(f'AFDate_KeystrokeEx("{fmt}");')
+    f = _pdf_str(f'AFDate_FormatEx("{fmt}");')
+    doc.xref_set_key(xref, "AA", f"<< /K << /S /JavaScript /JS {k} >> /F << /S /JavaScript /JS {f} >> >>")
+
+
+def _clear_format(doc: fitz.Document, xref: int):
+    if doc.xref_get_key(xref, "AA")[0] != "null":
+        doc.xref_set_key(xref, "AA", "null")
+
+
+_ISO_DATE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$")
+
+
+def _normalize_date(text: str) -> str:
+    """ISO dates (what <input type=date> sends) -> mm/dd/yyyy; else unchanged."""
+    m = _ISO_DATE.match(text.strip())
+    if not m:
+        return text
+    y, mo, d = m.groups()
+    return f"{int(mo):02d}/{int(d):02d}/{y}"
+
+
+def _listbox_appearance(doc: fitz.Document, w: fitz.Widget, selected: list[str]):
+    """Regenerate a list box appearance that highlights every selected row.
+
+    PyMuPDF's own appearance draws the option texts only (no selection).
+    """
+    try:
+        typ, ref = doc.xref_get_key(w.xref, "AP/N")
+        if typ != "xref":
+            return
+        ap = int(ref.split()[0])
+        r = fitz.Rect(w.rect)
+        W, H = r.width, r.height
+        opts, labels = _norm_options(w.choice_values)
+        fs = float(w.text_fontsize or 0) or 12.0
+        lh = fs * 1.116
+        ops = ["/Tx BMC", "q", "1 w", f"1 1 {W - 2:.3f} {H - 2:.3f} re", "W", "n"]
+        for i, o in enumerate(opts):
+            if o in selected:
+                y = H - 2 - (i + 1) * lh
+                ops.append(f"0.6 0.75 0.95 rg 1 {y:.3f} {W - 2:.3f} {lh:.3f} re f")
+        ops += ["BT", "0 0 0 rg", f"2 {H:.3f} Td"]
+        for i, lab in enumerate(labels):
+            try:
+                lab.encode("latin-1")
+                s = lab
+            except UnicodeEncodeError:
+                s = lab.encode("latin-1", "replace").decode("latin-1")
+            ops.append(f"0 {-lh:.3f} Td /Helv {fs:g} Tf {_pdf_str(s)} Tj")
+        ops += ["ET", "Q", "EMC"]
+        doc.update_stream(ap, "\n".join(ops).encode("latin-1"))
+    except Exception:
+        pass
+
+
+def _set_listbox(doc: fitz.Document, w: fitz.Widget, values: list[str]):
+    """Select ``values`` in a list box (several only if it is multi-select)."""
+    opts, _labels = _norm_options(w.choice_values)
+    w.field_value = values[0] if values else ""
+    w.update()
+    holder = _field_holder(doc, w)
+    if len(values) > 1:
+        doc.xref_set_key(holder, "V", "[" + " ".join(_pdf_str(v) for v in values) + "]")
+    elif not values:
+        doc.xref_set_key(holder, "V", "null")
+    idx = sorted(opts.index(v) for v in values if v in opts)
+    doc.xref_set_key(holder, "I", "[" + " ".join(map(str, idx)) + "]" if idx else "null")
+    _listbox_appearance(doc, w, values)
+
+
 def _widget_info(doc: fitz.Document, page: fitz.Page, w: fitz.Widget) -> dict:
     ftype = TYPE_NAMES.get(w.field_type, "unknown")
     flags = int(w.field_flags or 0)
     info: dict[str, Any] = {
+        "format": _field_format(doc, w),
         "id": w.xref,
         "page": page.number,
         "name": w.field_name or "",
@@ -315,6 +428,14 @@ def _widget_info(doc: fitz.Document, page: fitz.Page, w: fitz.Widget) -> dict:
         info["options"], info["option_labels"] = opts, labels
         info["value"] = w.field_value if w.field_value not in (None, "Off") else ""
         info["editable"] = bool(flags & FF_EDIT) if ftype == "combo" else False
+        if ftype == "list":
+            multi = bool(flags & FF_MULTISELECT)
+            info["multi_select"] = multi
+            sel = _choice_values_raw(doc, w)
+            if multi:
+                info["value"] = sel
+            elif sel:
+                info["value"] = sel[0]
     elif ftype == "signature":
         info["value"] = doc.xref_get_key(w.xref, "V")[0] != "null" or (
             _parent_xref(doc, w.xref) and doc.xref_get_key(_parent_xref(doc, w.xref), "V")[0] != "null"
@@ -423,6 +544,8 @@ def _fill_values(doc: fitz.Document, values: dict[str, Any], force_readonly: boo
         try:
             if ftype == "text":
                 text = "" if value is None else str(value)
+                if _field_format(doc, widgets[0]) == "date":
+                    text = _normalize_date(text)
                 for w in widgets:
                     if w.text_maxlen and len(text) > w.text_maxlen:
                         raise ValueError(f"value longer than max length {w.text_maxlen}")
@@ -454,6 +577,9 @@ def _fill_values(doc: fitz.Document, values: dict[str, Any], force_readonly: boo
                 editable = bool(int(w0.field_flags or 0) & FF_EDIT)
                 vals = value if isinstance(value, list) else [value]
                 vals = ["" if v is None else str(v) for v in vals]
+                multi = bool(int(w0.field_flags or 0) & FF_MULTISELECT)
+                if ftype == "list" and len([v for v in vals if v != ""]) > 1 and not multi:
+                    raise ValueError("this list box allows only one selection")
                 resolved = []
                 for v in vals:
                     if v in opts or v == "":
@@ -464,9 +590,18 @@ def _fill_values(doc: fitz.Document, values: dict[str, Any], force_readonly: boo
                         resolved.append(v)
                     else:
                         raise ValueError(f"'{v}' is not one of the options {opts}")
-                for w in widgets:
-                    w.field_value = resolved if (ftype == "list" and len(resolved) > 1) else resolved[0]
-                    w.update()
+                if ftype == "list":
+                    chosen = [v for v in resolved if v != ""]
+                    seen: list[str] = []
+                    for v in chosen:
+                        if v not in seen:
+                            seen.append(v)
+                    for w in widgets:
+                        _set_listbox(doc, w, seen)
+                else:
+                    for w in widgets:
+                        w.field_value = resolved[0] if resolved else ""
+                        w.update()
             elif ftype == "signature":
                 raise ValueError("signature fields cannot be filled with a value")
             else:
@@ -585,6 +720,8 @@ class CreateFieldRequest(BaseModel):
     multiline: bool = False
     max_len: int = 0
     editable: bool = False  # combo: allow custom text
+    multi_select: bool = False  # list: allow several selections
+    format: Optional[str] = None  # text: "date" -> Acrobat date format actions
 
 
 def _create_field(doc: fitz.Document, req: CreateFieldRequest) -> int:
@@ -645,6 +782,8 @@ def _create_field(doc: fitz.Document, req: CreateFieldRequest) -> int:
         w.choice_values = opts
         if ftype == "combo" and req.editable:
             flags |= FF_EDIT
+        if ftype == "list" and req.multi_select:
+            flags |= FF_MULTISELECT
         if isinstance(req.value, str) and req.value:
             if req.value not in opts and not (ftype == "combo" and req.editable):
                 raise HTTPException(status_code=400, detail=f"default '{req.value}' is not an option")
@@ -658,6 +797,10 @@ def _create_field(doc: fitz.Document, req: CreateFieldRequest) -> int:
     annot = page.add_widget(w)
     xref = annot.xref
 
+    if ftype == "text" and (req.format or "") == "date":
+        _set_date_format(doc, xref)
+    if ftype == "list" and isinstance(req.value, list) and req.value:
+        _fill_values(doc, {name: [str(v) for v in req.value]}, force_readonly=True)
     if ftype == "checkbox":
         export = (req.export_value or "").strip()
         if export and export != "Yes":
@@ -702,6 +845,8 @@ class UpdateFieldRequest(BaseModel):
     multiline: Optional[bool] = None
     max_len: Optional[int] = None
     editable: Optional[bool] = None
+    multi_select: Optional[bool] = None
+    format: Optional[str] = None  # "date" | "" (none); text fields only
 
 
 def _field_holder(doc: fitz.Document, w: fitz.Widget) -> int:
@@ -753,8 +898,22 @@ def _update_field(doc: fitz.Document, field_id: int, req: UpdateFieldRequest):
         setbit(FF_MULTILINE, req.multiline)
     if ftype == "combo":
         setbit(FF_EDIT, req.editable)
-    if any(v is not None for v in (req.required, req.readonly, req.multiline, req.editable)):
+    if ftype == "list":
+        setbit(FF_MULTISELECT, req.multi_select)
+    if any(v is not None for v in (req.required, req.readonly, req.multiline, req.editable, req.multi_select)):
         doc.xref_set_key(holder, "Ff", str(flags))
+    if ftype == "list" and req.multi_select is False:
+        sel = _choice_values_raw(doc, w)
+        if len(sel) > 1:  # keep only the first selection
+            _p, wl = _find_widget(doc, field_id)
+            _set_listbox(doc, wl, sel[:1])
+    if req.format is not None and ftype == "text":
+        if req.format == "date":
+            _set_date_format(doc, holder)
+        elif req.format in ("", "none"):
+            _clear_format(doc, holder)
+        else:
+            raise HTTPException(status_code=400, detail="format must be 'date' or ''")
 
     if req.tooltip is not None:
         doc.xref_set_key(holder, "TU", _pdf_str(req.tooltip) if req.tooltip else "null")
@@ -837,8 +996,9 @@ def _label_for(rect: fitz.Rect, words: list[tuple], prefer_right: bool = False) 
     cy = (rect.y0 + rect.y1) / 2
     if prefer_right:
         right = sorted((w for w in words if w[0] >= rect.x1 - 2 and w[1] <= cy <= w[3]
-                        and w[0] - rect.x1 < 30 and w[4].strip("_")), key=lambda w: w[0])
-        if right:
+                        and w[4].strip("_")), key=lambda w: w[0])
+        # only the FIRST word must be close to the box; the rest follow by word gap
+        if right and right[0][0] - rect.x1 < 30:
             run = [right[0]]
             for w in right[1:]:
                 if w[0] - run[-1][2] < 12 and len(run) < 5:
@@ -886,11 +1046,353 @@ def _text_inside(rect: fitz.Rect, words: list[tuple]) -> bool:
     return False
 
 
+def _segments_from_drawings(page: fitz.Page) -> tuple[list, list]:
+    """(horizontal, vertical) stroke segments from vector drawings.
+
+    horizontal: (x0, x1, y); vertical: (y0, y1, x).  Thin filled rects count.
+    """
+    hs, vs = [], []
+    for d in page.get_drawings():
+        for it in d.get("items", []):
+            if it[0] == "l":
+                p1, p2 = it[1], it[2]
+                if abs(p1.y - p2.y) < 1:
+                    hs.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
+                elif abs(p1.x - p2.x) < 1:
+                    vs.append((min(p1.y, p2.y), max(p1.y, p2.y), (p1.x + p2.x) / 2))
+            elif it[0] == "re":
+                r = fitz.Rect(it[1]).normalize()
+                if r.height <= 2 and r.width > 2:
+                    hs.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+                elif r.width <= 2 and r.height > 2:
+                    vs.append((r.y0, r.y1, (r.x0 + r.x1) / 2))
+    return hs, vs
+
+
+def _is_grid_rule(seg: tuple, vs: list, tol: float = 1.5) -> bool:
+    """A horizontal rule touched by >= 2 vertical rules is a table grid line,
+    not a fill-in line."""
+    x0, x1, y = seg
+    touching = 0
+    for vy0, vy1, vx in vs:
+        if x0 - tol <= vx <= x1 + tol and vy0 - tol <= y <= vy1 + tol:
+            touching += 1
+            if touching >= 2:
+                return True
+    return False
+
+
+def _table_header_rects(page: fitz.Page) -> tuple[list[fitz.Rect], list[fitz.Rect]]:
+    """(table bboxes, header-row bboxes) — header rows never become fields."""
+    tables, headers = [], []
+    try:
+        found = page.find_tables().tables
+    except Exception:
+        found = []
+    for t in found:
+        tables.append(fitz.Rect(t.bbox))
+        hdr = None
+        try:
+            if t.header is not None and t.header.bbox and not t.header.external:
+                hdr = fitz.Rect(t.header.bbox)
+        except Exception:
+            hdr = None
+        if hdr is None:
+            try:
+                hdr = fitz.Rect(t.rows[0].bbox)
+            except Exception:
+                hdr = None
+        if hdr is not None and not hdr.is_empty:
+            headers.append(hdr)
+    return tables, headers
+
+
+# ── raster (scanned page) line / box detection ──
+
+
+def _runs_1d(mask_row, min_len: int) -> list[tuple[int, int]]:
+    import numpy as np
+
+    padded = np.concatenate(([0], mask_row.astype(np.int8), [0]))
+    d = np.diff(padded)
+    starts = np.nonzero(d == 1)[0]
+    ends = np.nonzero(d == -1)[0]
+    return [(int(s), int(e)) for s, e in zip(starts, ends) if e - s >= min_len]
+
+
+def _raster_segments(dark, min_len: int, max_thick: int) -> list[tuple[int, int, int, int]]:
+    """Horizontal strokes in a boolean image -> (x0, x1, y0, y1) pixel boxes.
+
+    Runs on consecutive rows with (nearly) the same extent merge into one
+    stroke; strokes thicker than ``max_thick`` are solid areas, not lines.
+    """
+    open_: list[list[int]] = []  # [x0, x1, y0, y1]
+    done: list[list[int]] = []
+    for y in range(dark.shape[0]):
+        runs = _runs_1d(dark[y], min_len)
+        nxt = []
+        used = set()
+        for s in open_:
+            hit = None
+            for i, (a, b) in enumerate(runs):
+                if i not in used and abs(a - s[0]) <= 2 and abs(b - s[1]) <= 2:
+                    hit = i
+                    break
+            if hit is None:
+                done.append(s)
+            else:
+                used.add(hit)
+                a, b = runs[hit]
+                s[0], s[1], s[3] = min(s[0], a), max(s[1], b), y + 1
+                nxt.append(s)
+        for i, (a, b) in enumerate(runs):
+            if i not in used:
+                nxt.append([a, b, y, y + 1])
+        open_ = nxt
+    done.extend(open_)
+    return [tuple(s) for s in done if s[3] - s[2] <= max_thick]
+
+
+def _scanned_candidates(page: fitz.Page) -> Optional[tuple[list[dict], list[tuple]]]:
+    """For a scanned (image-only) page: OCR words for labels plus line / box
+    detection on the rendered page.  Returns None for normal pages."""
+    try:
+        from backend.features import convert as _conv
+    except Exception:  # pragma: no cover
+        return None
+    info = _conv._page_scan_info(page)
+    if not info["is_scanned"] or len(page.get_text("words")) > 5:
+        return None
+    import numpy as np
+
+    words: list[tuple] = []
+    langs = _conv._available_languages()
+    if langs:
+        lang = "eng" if "eng" in langs else langs[0]
+        try:
+            words = list(_conv._ocr_words(page, lang, 300, _conv._tessdata(lang)))
+        except Exception:
+            words = []
+    dpi = 150
+    scale = dpi / 72
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, : pix.width]
+    dark = arr < 140
+    max_thick = max(2, int(round(2.5 * scale)))
+    hsegs = _raster_segments(dark, int(6 * scale), max_thick)
+    vsegs = [(y0, y1, x0, x1) for (y0, y1, x0, x1) in _raster_segments(dark.T, int(6 * scale), max_thick)]
+    to_pt = lambda v: v / scale
+    H = [(to_pt(a), to_pt(b), to_pt((c + d) / 2)) for a, b, c, d in hsegs]   # (x0, x1, y)
+    V = [(to_pt(a), to_pt(b), to_pt((c + d) / 2)) for a, b, c, d in vsegs]   # (y0, y1, x)
+
+    cands: list[dict] = []
+    used_h: set[int] = set()
+    tol = 3.0
+    # Boxes: two horizontal strokes with the same extent joined by verticals at both ends.
+    for i, (ax0, ax1, ay) in enumerate(H):
+        for j, (bx0, bx1, by) in enumerate(H):
+            if j == i or by <= ay + 5 or abs(ax0 - bx0) > tol or abs(ax1 - bx1) > tol:
+                continue
+            hgt = by - ay
+            if hgt > 160:
+                continue
+            left = any(abs(vx - ax0) <= tol and vy0 <= ay + tol and vy1 >= by - tol for vy0, vy1, vx in V)
+            right = any(abs(vx - ax1) <= tol and vy0 <= ay + tol and vy1 >= by - tol for vy0, vy1, vx in V)
+            if not (left and right):
+                continue
+            r = fitz.Rect(ax0, ay, ax1, by)
+            w = r.width
+            if 6 <= w <= 24 and 6 <= hgt <= 24 and abs(w - hgt) <= 4:
+                # tesseract often reads an empty box as "[]", "L]", "O": ignore those
+                inner_words = [x for x in words if _overlap_ratio(fitz.Rect(x[:4]), r) > 0.3
+                               and sum(ch.isalnum() for ch in x[4]) >= 2]
+                if not inner_words:
+                    cands.append({"type": "checkbox", "rect": r, "source": "scan-box"})
+                    used_h.update((i, j))
+            elif w >= 30 and hgt >= 10:
+                inner = fitz.Rect(r.x0 + 1.5, r.y0 + 1.5, r.x1 - 1.5, r.y1 - 1.5)
+                if not _text_inside(inner, words):
+                    cands.append({"type": "text", "rect": inner, "source": "scan-box", "multiline": hgt > 40})
+                    used_h.update((i, j))
+    # Underlines: long horizontal strokes that are not part of a box or a grid.
+    pr = page.rect
+    for i, (x0, x1, y) in enumerate(H):
+        if i in used_h or x1 - x0 < 50 or x1 - x0 > pr.width * 0.9:
+            continue
+        if _is_grid_rule((x0, x1, y), V, tol=tol):
+            continue
+        fr = fitz.Rect(x0, y - 16, x1, y - 1.5)
+        if _text_inside(fr, words):
+            continue
+        cands.append({"type": "text", "rect": fr, "source": "scan-line"})
+    # "Label:" followed by blank space, from OCR lines.
+    lines: dict[tuple, list[tuple]] = {}
+    for w in words:
+        lines.setdefault((w[5], w[6]), []).append(w)
+    for ws in lines.values():
+        ws.sort(key=lambda w: w[0])
+        for k, w in enumerate(ws):
+            if not w[4].endswith(":"):
+                continue
+            lb = fitz.Rect(ws[0][:4])
+            for x in ws[: k + 1]:
+                lb |= fitz.Rect(x[:4])
+            nxt = ws[k + 1][0] if k + 1 < len(ws) else pr.x1 - 36
+            start, limit = lb.x1 + 4, nxt - 6
+            if limit - start < 60:
+                continue
+            # A heading such as "Comments:" or "Symptoms (check all that apply):"
+            # whose answer is a box or a column of option boxes directly BELOW
+            # it: the blank space to its right is not a field.
+            if any(c["source"] == "scan-box" and 0 <= c["rect"].y0 - lb.y1 <= 30
+                   and lb.x0 - 20 <= c["rect"].x0 <= lb.x0 + 120 for c in cands):
+                continue
+            cy = (lb.y0 + lb.y1) / 2
+            h = max(14.0, lb.height + 4)
+            cands.append({"type": "text", "source": "scan-label", "rect": fitz.Rect(start, cy - h / 2, limit, cy + h / 2)})
+    # Label words: drop OCR noise (tokens without letters/digits, e.g. "|" for a
+    # box edge) and whatever tesseract read off the checkboxes themselves.
+    boxes = [c["rect"] for c in cands if c["type"] == "checkbox"]
+    clean = []
+    for w in words:
+        if not any(ch.isalnum() for ch in w[4]):
+            continue
+        if any(_overlap_ratio(fitz.Rect(w[:4]), b) > 0.5 for b in boxes):
+            continue
+        clean.append(w)
+    return cands, clean
+
+
+_DATE_LABEL_RE = re.compile(r"(\bdate\b|\bdob\b|d\.o\.b|\bbirth|\bbirthday\b|\bdated\b)", re.I)
+_MULTI_HINT_RE = re.compile(r"(all that apply|check all|select all|any that apply)", re.I)
+
+
+def _row_text_left(r: fitz.Rect, words: list[tuple], exclude: list[fitz.Rect]) -> str:
+    cy = (r.y0 + r.y1) / 2
+    left = [w for w in words if w[2] <= r.x0 + 1 and w[1] - 2 <= cy <= w[3] + 2 and r.x0 - w[2] < 300
+            and w[4].strip("_") and not any(fitz.Rect(w[:4]).intersects(e) for e in exclude)]
+    left.sort(key=lambda w: w[0])
+    if not left:
+        return ""
+    run = [left[-1]]
+    for w in reversed(left[:-1]):
+        if run[0][0] - w[2] < 14:
+            run.insert(0, w)
+        else:
+            break
+    return " ".join(w[4] for w in run).strip()
+
+
+def _text_above(r: fitz.Rect, words: list[tuple]) -> str:
+    above = [w for w in words if 0 <= r.y0 - w[3] < 24 and r.x0 - 40 <= w[0] <= r.x0 + 250 and w[4].strip("_")]
+    if not above:
+        return ""
+    y = max(w[3] for w in above)
+    row = sorted((w for w in above if abs(w[3] - y) < 3), key=lambda w: w[0])
+    return " ".join(w[4] for w in row).strip()
+
+
+def _group_radios(cands: list[dict], words: list[tuple]) -> None:
+    """Turn rows/columns of option boxes that share a question label into radio groups.
+
+    Row:    "Gender:  [ ] Male  [ ] Female  [ ] Other"
+    Column: "Preferred contact?" with option boxes stacked under it.
+    Boxes whose question says "check all that apply" stay checkboxes.
+    """
+    boxes = [c for c in cands if c["type"] == "checkbox"]
+    taken: set[int] = set()
+
+    def finish(group: list[dict], question: str):
+        q = question.strip().rstrip(":?").strip()
+        if not q or _MULTI_HINT_RE.search(question):
+            return
+        exports: list[str] = []
+        for n, c in enumerate(group):
+            e = (c.get("label") or "").strip() or f"Choice{n + 1}"
+            while e in exports:
+                e += "_"
+            exports.append(e)
+        for c, e in zip(group, exports):
+            c["type"] = "radio"
+            c["group"] = q
+            c["export"] = e
+            taken.add(id(c))
+
+    # rows
+    rows: list[list[dict]] = []
+    for c in sorted(boxes, key=lambda c: (c["rect"].y0, c["rect"].x0)):
+        cy = (c["rect"].y0 + c["rect"].y1) / 2
+        for row in rows:
+            r0 = row[0]["rect"]
+            if abs(cy - (r0.y0 + r0.y1) / 2) <= max(3.0, r0.height * 0.4) and abs(c["rect"].height - r0.height) <= 4:
+                row.append(c)
+                break
+        else:
+            rows.append([c])
+    for row in rows:
+        if len(row) < 2:
+            continue
+        row.sort(key=lambda c: c["rect"].x0)
+        opt_rects = [fitz.Rect(c["rect"]) for c in row]
+        # option labels sit right of each box; the question is left of the first box
+        question = _row_text_left(row[0]["rect"], words, opt_rects)
+        if question:
+            finish(row, question)
+    # columns
+    cols: list[list[dict]] = []
+    for c in sorted((b for b in boxes if id(b) not in taken), key=lambda c: (c["rect"].x0, c["rect"].y0)):
+        for col in cols:
+            last = col[-1]["rect"]
+            if abs(c["rect"].x0 - last.x0) <= 3 and 0 < c["rect"].y0 - last.y1 <= max(14.0, last.height * 2.5):
+                col.append(c)
+                break
+        else:
+            cols.append([c])
+    for col in cols:
+        if len(col) < 2:
+            continue
+        question = _text_above(col[0]["rect"], words)
+        if question and question.rstrip().endswith((":", "?")):
+            finish(col, question)
+
+
 def _detect_on_page(page: fitz.Page, taken_rects: list[fitz.Rect]) -> list[dict]:
     """Return candidate fields in *unrotated* page coordinates."""
+    scanned = _scanned_candidates(page)
+    if scanned is not None:
+        cands, words = scanned
+        headers: list[fitz.Rect] = []
+    else:
+        cands, words, headers = _vector_candidates(page)
+    pr = page.rect
+
+    # De-duplicate (priority = order above) and against existing widgets.
+    accepted: list[dict] = []
+    for c in cands:
+        r = c["rect"]
+        if r.width < 4 or r.height < 4 or not r.intersects(pr):
+            continue
+        # Table header rows are column titles, never fill-in fields.
+        if any(_overlap_ratio(r, h) > 0.2 for h in headers):
+            continue
+        if any(_overlap_ratio(r, t) > 0.25 for t in taken_rects):
+            continue
+        if any(_overlap_ratio(r, a["rect"]) > 0.25 for a in accepted):
+            continue
+        c["label"] = _label_for(r, words, prefer_right=c["type"] == "checkbox")
+        if c["type"] == "text" and _DATE_LABEL_RE.search(c["label"] or ""):
+            c["format"] = "date"
+        accepted.append(c)
+    _group_radios(accepted, words)
+    return accepted
+
+
+def _vector_candidates(page: fitz.Page) -> tuple[list[dict], list[tuple], list[fitz.Rect]]:
     words = page.get_text("words")
     pr = page.rect
     cands: list[dict] = []
+    hs, vs = _segments_from_drawings(page)
+    _tables, headers = _table_header_rects(page)
 
     # 1. Rectangles from vector drawings: small squares -> checkboxes, empty boxes -> text fields.
     rects: list[fitz.Rect] = []
@@ -975,6 +1477,8 @@ def _detect_on_page(page: fitz.Page, taken_rects: list[fitz.Rect]) -> list[dict]
             x0, x1, y = seg
             if x1 - x0 > pr.width * 0.9:
                 continue  # page-wide separators
+            if _is_grid_rule(seg, vs):
+                continue  # table grid rule (e.g. the line above a header row)
             # part of a drawn box? (an existing rect shares this edge)
             if any(abs(u.y0 - y) < 1.5 or abs(u.y1 - y) < 1.5 for u in uniq
                    if u.height > 3 and u.x0 - 1 <= x0 and u.x1 + 1 >= x1):
@@ -1004,25 +1508,13 @@ def _detect_on_page(page: fitz.Page, taken_rects: list[fitz.Rect]) -> list[dict]
         fr = fitz.Rect(start, cy - h / 2, limit, cy + h / 2)
         cands.append({"type": "text", "source": "label", "rect": fr})
 
-    # De-duplicate (priority = order above) and against existing widgets.
-    accepted: list[dict] = []
-    for c in cands:
-        r = c["rect"]
-        if r.width < 4 or r.height < 4 or not r.intersects(pr):
-            continue
-        if any(_overlap_ratio(r, t) > 0.25 for t in taken_rects):
-            continue
-        if any(_overlap_ratio(r, a["rect"]) > 0.25 for a in accepted):
-            continue
-        c["label"] = _label_for(r, words, prefer_right=c["type"] == "checkbox")
-        accepted.append(c)
-    return accepted
+    return cands, words, headers
 
 
 class DetectRequest(BaseModel):
     pages: Optional[list[int]] = None  # default: all pages
     dry_run: bool = False
-    types: list[str] = Field(default_factory=lambda: ["text", "checkbox"])
+    types: list[str] = Field(default_factory=lambda: ["text", "checkbox", "radio"])
 
 
 def _detect(doc: fitz.Document, req: DetectRequest) -> dict:
@@ -1037,14 +1529,31 @@ def _detect(doc: fitz.Document, req: DetectRequest) -> dict:
             page.set_rotation(0)
         try:
             taken = [fitz.Rect(w.rect) for w in page.widgets()]
-            found = [c for c in _detect_on_page(page, taken) if c["type"] in req.types]
-            # name assignment
+            found = _detect_on_page(page, taken)
+            if "radio" not in req.types:
+                for c in found:
+                    if c["type"] == "radio":
+                        c["type"] = "checkbox"
+            found = [c for c in found if c["type"] in req.types]
+            # name assignment (one name per radio group)
+            group_names: dict[str, str] = {}
             for c in found:
+                if c["type"] == "radio":
+                    g = c["group"]
+                    if g not in group_names:
+                        group_names[g] = _unique_name(g, taken_names)
+                        taken_names.add(group_names[g])
+                    c["name"] = group_names[g]
+                    continue
                 base = c["label"] or ("checkbox" if c["type"] == "checkbox" else "text")
                 c["name"] = _unique_name(base, taken_names)
                 taken_names.add(c["name"])
             if not req.dry_run:
                 for c in found:
+                    if c["type"] == "radio":
+                        c["id"] = _add_radio_kid(doc, page, c["rect"], c["name"], c["export"],
+                                                 FF_RADIO | FF_NOTOGGLETOOFF, c["group"])
+                        continue
                     w = fitz.Widget()
                     w.field_type = TYPE_CODES[c["type"]]
                     w.field_name = c["name"]
@@ -1060,6 +1569,10 @@ def _detect(doc: fitz.Document, req: DetectRequest) -> dict:
                         w.field_value = False
                     annot = page.add_widget(w)
                     c["id"] = annot.xref
+                    if c.get("format") == "date":
+                        _set_date_format(doc, annot.xref)
+                        if not c["label"]:
+                            doc.xref_set_key(annot.xref, "TU", _pdf_str(f"Date ({DATE_FORMAT})"))
         finally:
             if rot:
                 page.set_rotation(rot)
@@ -1074,6 +1587,11 @@ def _detect(doc: fitz.Document, req: DetectRequest) -> dict:
             }
             if "id" in c:
                 out["id"] = c["id"]
+            if c["type"] == "radio":
+                out["export_value"] = c["export"]
+                out["group"] = c["group"]
+            if c.get("format"):
+                out["format"] = c["format"]
             (candidates if req.dry_run else created).append(out)
     return {"created": created, "candidates": candidates, "count": len(created) or len(candidates)}
 
@@ -1342,9 +1860,14 @@ async def flatten_form_fields(doc_id: str):
 @router.post("/{doc_id}/form-fields/detect")
 async def detect_form_fields(doc_id: str, req: Optional[DetectRequest] = None):
     """Find fill-in areas on flat forms (underscores, empty boxes, rule lines,
-    'Label:' + blank space, ☐ glyphs) and create text fields / checkboxes."""
+    'Label:' + blank space, ☐ glyphs) and create text fields / checkboxes.
+
+    Table header rows never become fields.  Option boxes sharing a question
+    label become radio groups; blanks labelled Date/DOB get Acrobat date
+    format actions.  Scanned (image-only) pages are OCR'd for labels and the
+    rendered page is searched for underline / box strokes."""
     req = req or DetectRequest()
-    bad = [t for t in req.types if t not in ("text", "checkbox")]
+    bad = [t for t in req.types if t not in ("text", "checkbox", "radio")]
     if bad:
         raise HTTPException(status_code=400, detail=f"unsupported detect types {bad}")
     if req.dry_run:

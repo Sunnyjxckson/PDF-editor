@@ -12,7 +12,7 @@ import {
   Search, Shapes, Stamp, StickyNote, Strikethrough, Trash2, Type, Underline, X,
 } from "lucide-react";
 import {
-  listComments, replyToComment, setCommentStatus, updateComment, deleteComment,
+  listComments, replyToComment, replyDepths, setCommentStatus, updateComment, deleteComment,
   groupCommentsByPage, filterComments, rgb01ToHex, hexToRgb01, REVIEW_STATUSES,
   type PdfComment, type ReviewStatus,
 } from "@/lib/features/organize";
@@ -172,6 +172,7 @@ function CommentCard({ c, expanded, onToggle, onReply, onStatus, onEdit, onDelet
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(c.contents);
   const Icon = ICONS[c.type] || MessageSquare;
+  const depths = replyDepths(c); // replies are /IRT thread members, nested by what they answer
   const swatch = rgb01ToHex(c.color, "#facc15");
 
   return (
@@ -208,7 +209,8 @@ function CommentCard({ c, expanded, onToggle, onReply, onStatus, onEdit, onDelet
           ) : null}
 
           {c.replies.map((r) => (
-            <div key={r.id} className="ml-3 pl-2 border-l-2 border-gray-200 dark:border-gray-700">
+            <div key={r.id} data-testid={`reply-${r.id}`} className="pl-2 border-l-2 border-gray-200 dark:border-gray-700"
+              style={{ marginLeft: 12 * (depths[r.id] ?? 1) }}>
               <div className="flex gap-1.5 text-[11px]">
                 <span className="font-medium text-gray-700 dark:text-gray-200">{r.author || "Unknown"}</span>
                 <span className="text-gray-400">{fmtDate(r.created)}</span>

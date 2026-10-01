@@ -26,9 +26,12 @@ Workflow
 2. Review: ``GET /{id}/redact/marks``; remove with ``DELETE``.
 3. Apply: ``POST /{id}/redact/apply`` burns in every pending mark — text,
    image pixels and vector art beneath are removed — then saves with garbage
-   collection so the old content streams are not left in the file.
+   collection so the old content streams are not left in the file, then
+   purges every undo snapshot and derived text cache (analysis.json, chat
+   history) for the document. Applying redactions is NOT undoable.
 
-Every mutating route calls ``snapshot()`` first so undo/redo works.
+Every mutating route calls ``snapshot()`` first so undo/redo works (apply then
+purges history, see above).
 """
 
 from __future__ import annotations
@@ -622,8 +625,16 @@ async def apply_redactions(doc_id: str, req: ApplyRequest):
         leftover += sum(remaining.values())
 
     _save_in_place(doc, path)
+    # The snapshot taken above (and every earlier one) still contains the
+    # content that was just removed. Redaction is irreversible by design, so
+    # purge all of it rather than leave the secret recoverable via undo or by
+    # reading uploads/<id>/history/ directly.
+    purge = advanced_ops.purge_history_after_redaction(doc_id, "Apply redactions")
     return {
         "status": "ok",
+        "undoable": False,
+        "history_purged": True,
+        "purged_files": purge["removed_files"],
         "applied": applied,
         "pages_affected": pages_affected,
         "removed_chars": removed_chars,
@@ -968,7 +979,18 @@ async def sanitize_document(doc_id: str, req: SanitizeRequest):
     ):
         if getattr(req, key):
             actions.append(f"Removed {label}")
-    return {"status": "ok", "before": before, "after": after, "actions": actions}
+    # Earlier snapshots still hold the hidden data that was just removed, so
+    # purge them the same way apply-redactions does.
+    purge = advanced_ops.purge_history_after_redaction(doc_id, "Sanitize document")
+    return {
+        "status": "ok",
+        "before": before,
+        "after": after,
+        "actions": actions,
+        "undoable": False,
+        "history_purged": True,
+        "purged_files": purge["removed_files"],
+    }
 
 
 # ─── Protect / unlock ────────────────────────────────────────────────────────

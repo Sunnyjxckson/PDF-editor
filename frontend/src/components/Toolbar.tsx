@@ -29,6 +29,7 @@ import { rotatePage, deletePage, getExportUrl, getDocumentInfo, getHistory, type
 import { MODES, activateMode, isModeActive } from "@/lib/modes";
 import { performUndo, performRedo } from "@/lib/history";
 
+// 100% = actual physical size (72pt = 1in = 96 CSS px); see CSS_PX_PER_PT in the store.
 const zoomPresets = [
   { label: "50%", value: 0.5 },
   { label: "75%", value: 0.75 },
@@ -36,6 +37,7 @@ const zoomPresets = [
   { label: "125%", value: 1.25 },
   { label: "150%", value: 1.5 },
   { label: "200%", value: 2 },
+  { label: "300%", value: 3 },
 ];
 
 const fontSizeOptions = [8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48];
@@ -87,6 +89,10 @@ export default function Toolbar() {
     setActiveTool,
     zoom,
     setZoom,
+    zoomMode,
+    setZoomMode,
+    zoomIn,
+    zoomOut,
     currentPage,
     totalPages,
     setCurrentPage,
@@ -387,8 +393,8 @@ export default function Toolbar() {
         <div className="hidden sm:flex items-center gap-0.5">
           <TooltipButton
             label="Zoom out"
-            shortcut="-"
-            onClick={() => setZoom(zoom - 0.25)}
+            shortcut="Ctrl/Cmd -"
+            onClick={zoomOut}
             className={btnBase}
           >
             <ZoomOut className="w-5 h-5" />
@@ -398,7 +404,11 @@ export default function Toolbar() {
             <Tooltip.Root>
               <Tooltip.Trigger asChild>
                 <DropdownMenu.Trigger asChild>
-                  <button className="text-sm text-gray-600 dark:text-gray-400 min-w-[48px] text-center tabular-nums px-1.5 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+                  <button
+                    aria-label={`Zoom ${Math.round(zoom * 100)}%${zoomMode === "fit-width" ? ", fit width" : zoomMode === "fit-page" ? ", fit page" : ""}`}
+                    data-testid="zoom-menu"
+                    className="text-sm text-gray-600 dark:text-gray-400 min-w-[48px] text-center tabular-nums px-1.5 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+                  >
                     {Math.round(zoom * 100)}%
                   </button>
                 </DropdownMenu.Trigger>
@@ -421,7 +431,7 @@ export default function Toolbar() {
                     key={preset.value}
                     onSelect={() => setZoom(preset.value)}
                     className={`px-3 py-1.5 text-sm cursor-pointer outline-none transition-colors ${
-                      Math.abs(zoom - preset.value) < 0.01
+                      zoomMode === "custom" && Math.abs(zoom - preset.value) < 0.01
                         ? "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400"
                         : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
                     }`}
@@ -430,23 +440,37 @@ export default function Toolbar() {
                   </DropdownMenu.Item>
                 ))}
                 <DropdownMenu.Separator className="h-px bg-gray-200 dark:bg-gray-700 my-1" />
-                <DropdownMenu.Item
-                  onSelect={() => {
-                    // Fit Width approximation: reset to 100%
-                    setZoom(1);
-                  }}
-                  className="px-3 py-1.5 text-sm cursor-pointer outline-none text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
-                >
-                  Fit Width
-                </DropdownMenu.Item>
+                {(
+                  [
+                    ["custom", "Actual size", "Ctrl/Cmd 0"],
+                    ["fit-width", "Fit width", ""],
+                    ["fit-page", "Fit page", ""],
+                  ] as const
+                ).map(([mode, label, hint]) => {
+                  const on = mode === "custom" ? zoomMode === "custom" && Math.abs(zoom - 1) < 0.01 : zoomMode === mode;
+                  return (
+                    <DropdownMenu.Item
+                      key={mode}
+                      onSelect={() => (mode === "custom" ? setZoom(1) : setZoomMode(mode))}
+                      className={`px-3 py-1.5 text-sm cursor-pointer outline-none transition-colors flex items-center justify-between gap-3 ${
+                        on
+                          ? "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400"
+                          : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      {label}
+                      {hint && <span className="text-[10px] text-gray-400">{hint}</span>}
+                    </DropdownMenu.Item>
+                  );
+                })}
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
 
           <TooltipButton
             label="Zoom in"
-            shortcut="+"
-            onClick={() => setZoom(zoom + 0.25)}
+            shortcut="Ctrl/Cmd +"
+            onClick={zoomIn}
             className={btnBase}
           >
             <ZoomIn className="w-5 h-5" />
@@ -574,7 +598,7 @@ export default function Toolbar() {
           {/* Zoom */}
           <div className="flex items-center gap-2 justify-center">
             <button
-              onClick={() => setZoom(zoom - 0.25)}
+              onClick={zoomOut}
               className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800"
             >
               <ZoomOut className="w-4 h-4" />
@@ -583,7 +607,7 @@ export default function Toolbar() {
               {Math.round(zoom * 100)}%
             </span>
             <button
-              onClick={() => setZoom(zoom + 0.25)}
+              onClick={zoomIn}
               className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800"
             >
               <ZoomIn className="w-4 h-4" />

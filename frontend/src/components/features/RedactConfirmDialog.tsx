@@ -35,7 +35,7 @@ export default function RedactConfirmDialog({
               Anyone you send the exported file to cannot recover them.
             </p>
             <p className="mt-2 text-xs text-gray-500 dark:text-gray-500">
-              Undo works only during this editing session.
+              This cannot be undone: undo history is cleared so no unredacted copy is kept.
             </p>
             <label className="mt-3 flex items-center gap-2 text-sm">
               <input

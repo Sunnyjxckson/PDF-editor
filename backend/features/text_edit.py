@@ -32,7 +32,20 @@ How an edit works
 4. Paragraph (block) edits are re-laid-out by our own word wrapper inside the
    original block width, at the original first baseline, line pitch and
    alignment. If the new text needs more height it first grows into free
-   space below the block, then shrinks the font in small steps (to 85%).
+   space below the block, then shrinks the font in small steps (to 85%),
+   then pushes the following blocks of the same column down (re-inserted
+   glyph-exact) when the page has room. If none of that works nothing is
+   written: 422 ``{code: "overflow", needed_height, available_height,
+   fit_size, ...}``; the client then resends with ``overflow: "shrink"``
+   (shrink below 85% until it fits) or ``overflow: "allow"`` (write at the
+   requested size and overlap).
+5. Spacing: horizontal scaling (Tz) is recovered from the glyph box height vs
+   the reported size, character spacing (Tc) and word spacing (Tw) from the
+   measured glyph advances vs the font's natural advances. Re-inserted text
+   reproduces them (glyph-by-glyph placement + a horizontal-scale morph).
+6. When the embedded (subset) font lacks some glyphs of the new text, those
+   glyphs alone fall back to the Base-14 equivalent; the rest keep using the
+   embedded font (``FontStack``).
 
 Coordinates
 -----------
@@ -40,10 +53,11 @@ Everything crossing this API is in PDF points, top-left origin, in the
 *visible* page space (``page.rect`` — rotation already applied, i.e. the space
 of the rendered page image). PyMuPDF text extraction / insertion works in the
 unrotated space; conversion happens here with ``page.rotation_matrix``.
-Text whose direction is a multiple of 90 degrees (rotated pages, vertical
-labels) is handled by laying it out in a local horizontal frame and writing it
-back with a rotation ``morph``. Text at other angles is reported as
-``editable: false``.
+Text at any angle (rotated pages, vertical labels, slanted stamps) is handled
+by laying it out in a local horizontal frame and writing it back with a
+rotation ``morph``. Removal of slanted text uses per-glyph point quads (MuPDF
+tests a redaction quad by its bounding box, so one rotated band would also
+hit neighbours).
 
 Every mutating route calls ``snapshot()`` first so undo/redo works.
 """
@@ -242,6 +256,16 @@ class Frame:
                          max(p.x for p in pts), max(p.y for p in pts))
 
     @property
+    def is_right(self) -> bool:
+        """Text runs along a page axis (0/90/180/270)."""
+        return abs(self.angle / 90.0 - round(self.angle / 90.0)) < 1e-6
+
+    def quad_local(self, q) -> fitz.Rect:
+        pts = [self.pt_local(p) for p in (q.ul, q.ur, q.ll, q.lr)]
+        return fitz.Rect(min(p.x for p in pts), min(p.y for p in pts),
+                         max(p.x for p in pts), max(p.y for p in pts))
+
+    @property
     def morph(self):
         if abs(self.angle) < 1e-6:
             return None
@@ -249,14 +273,33 @@ class Frame:
         # visual rotation is the inverse of the y-down matrix ``to_page``.
         return (self.pivot, self.to_local)
 
+    def morph_scaled(self, hscale: float):
+        """Morph for text compressed/expanded horizontally by ``hscale`` (Tz)."""
+        if abs(hscale - 1.0) < 1e-6:
+            return self.morph
+        # x-scaling commutes with the y-flip, so it composes before the rotation
+        return (self.pivot, fitz.Matrix(hscale, 0, 0, 1, 0, 0) * self.to_local)
 
-def _dir_angle(d) -> Optional[float]:
-    """Angle of a line direction if it is (within 0.5 deg) a multiple of 90."""
+
+ANGLE_TOL = 0.5  # degrees
+
+
+def _dir_angle(d) -> float:
+    """Angle (degrees, y-down page space) of a line direction. Snapped to the
+    nearest multiple of 90 when within ``ANGLE_TOL``; any other angle is
+    returned as measured."""
     ang = math.degrees(math.atan2(d[1], d[0]))
     snapped = round(ang / 90.0) * 90.0
-    if abs(ang - snapped) > 0.5:
-        return None
-    return snapped % 360.0
+    if abs(ang - snapped) <= ANGLE_TOL:
+        return snapped % 360.0
+    return round(ang % 360.0, 4)
+
+
+def _same_angle(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None:
+        return False
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d) <= ANGLE_TOL
 
 
 # ─── Extraction model ───────────────────────────────────────────────────────
@@ -266,19 +309,21 @@ def _dir_angle(d) -> Optional[float]:
 class Char:
     c: str
     origin: fitz.Point  # page coords
-    bbox: fitz.Rect     # page coords
+    bbox: fitz.Rect     # page coords (axis-aligned box of the glyph)
+    quad: Optional[fitz.Quad] = None  # page coords, follows the text direction
 
 
 @dataclass
 class Span:
     id: str
     font: str
-    size: float
+    size: float  # true (vertical) font size; MuPDF reports sqrt(sx*sy)
     color: int
     flags: int
     chars: list[Char]
     bbox: fitz.Rect
     origin: fitz.Point
+    hscale: float = 1.0  # horizontal scaling (Tz / 100), 1 = none
 
     @property
     def text(self) -> str:
@@ -320,29 +365,79 @@ class Block:
         return "\n".join(ln.text for ln in self.lines)
 
 
+def _span_scale(sp: dict, ldir, size: float) -> tuple[float, float]:
+    """(true size, hscale) of a raw span.
+
+    MuPDF reports ``size`` as sqrt(sx*sy) of the text matrix, while the glyph
+    boxes are ``(ascender - descender) * sy`` tall. So sy (the real font size)
+    comes from the box height, and Tz = sx/sy = (size/sy)**2."""
+    ang = _dir_angle(ldir)
+    k = float(sp.get("ascender", 0.0)) - float(sp.get("descender", 0.0))
+    if size <= 0 or k < 0.3 or abs(ang / 90.0 - round(ang / 90.0)) > 1e-6:
+        return size, 1.0
+    fr = Frame(pivot=fitz.Point(sp["origin"]), angle=ang)
+    h = fr.rect_local(fitz.Rect(sp["bbox"])).height
+    if h <= 0:
+        return size, 1.0
+    v = h / k
+    a = size / v
+    if abs(a - 1.0) <= 0.01 or not (0.3 < a < 3.0):
+        return size, 1.0
+    return v, a * a
+
+
 def _raw_lines(bi: int, b: dict) -> list[Line]:
     lines = []
     for li, ln in enumerate(b.get("lines", [])):
         spans = []
+        ldir = tuple(ln.get("dir", (1, 0)))
         for si, sp in enumerate(ln.get("spans", [])):
-            chars = [Char(c=ch["c"], origin=fitz.Point(ch["origin"]), bbox=fitz.Rect(ch["bbox"]))
-                     for ch in sp.get("chars", [])]
+            chars = []
+            for ch in sp.get("chars", []):
+                try:
+                    q = fitz.recover_char_quad(ldir, sp, ch)
+                except Exception:
+                    q = fitz.Rect(ch["bbox"]).quad
+                chars.append(Char(c=ch["c"], origin=fitz.Point(ch["origin"]), bbox=fitz.Rect(ch["bbox"]), quad=q))
             if not chars:
                 continue
+            size, hscale = _span_scale(sp, ldir, float(sp.get("size", 11)))
             spans.append(Span(
-                id=f"b{bi}.l{li}.s{si}", font=sp.get("font", ""), size=float(sp.get("size", 11)),
+                id=f"b{bi}.l{li}.s{si}", font=sp.get("font", ""), size=size,
                 color=int(sp.get("color", 0)), flags=int(sp.get("flags", 0)), chars=chars,
-                bbox=fitz.Rect(sp["bbox"]), origin=fitz.Point(sp["origin"]),
+                bbox=fitz.Rect(sp["bbox"]), origin=fitz.Point(sp["origin"]), hscale=hscale,
             ))
         lines.append(Line(id=f"b{bi}.l{li}", bbox=fitz.Rect(ln["bbox"]),
-                          dir=tuple(ln.get("dir", (1, 0))), spans=spans))
+                          dir=ldir, spans=spans))
     return lines
+
+
+def _chars_of(obj) -> list[Char]:
+    if isinstance(obj, Char):
+        return [obj]
+    if isinstance(obj, Span):
+        return obj.chars
+    if isinstance(obj, Line):
+        return [c for s in obj.spans for c in s.chars]
+    return [c for ln in obj.lines for s in ln.spans for c in s.chars]
+
+
+def _lrect(fr: "Frame", obj) -> fitz.Rect:
+    """Box of a Block/Line/Span/Char in ``fr``'s local frame. For right-angle
+    frames this is the exact transform of the axis-aligned bbox; for slanted
+    text the union of the per-glyph quads (the bbox would be far too big)."""
+    if fr.is_right:
+        return fr.rect_local(obj.bbox)
+    r = fitz.Rect()
+    for c in _chars_of(obj):
+        r |= fr.quad_local(c.quad if c.quad is not None else fitz.Rect(c.bbox).quad)
+    return r if not r.is_empty else fr.rect_local(obj.bbox)
 
 
 def _starts_new_paragraph(prev: Line, cur: Line, pitch: Optional[float]) -> bool:
     """Should ``cur`` start a new paragraph after ``prev`` (same raw block)?"""
     a_prev, a_cur = _dir_angle(prev.dir), _dir_angle(cur.dir)
-    if a_prev is None or a_cur is None or a_prev != a_cur:
+    if not _same_angle(a_prev, a_cur):
         return True
     fr = Frame(pivot=fitz.Point(prev.origin), angle=a_prev)
     d = fr.pt_local(cur.origin).y - fr.pt_local(prev.origin).y
@@ -387,7 +482,7 @@ def extract_blocks(page: fitz.Page) -> list[Block]:
                 groups.append(cur)
                 cur, pitch = [], None
             if cur and pitch is None:
-                fr = Frame(pivot=fitz.Point(cur[-1].origin), angle=_dir_angle(cur[-1].dir) or 0.0)
+                fr = Frame(pivot=fitz.Point(cur[-1].origin), angle=_dir_angle(cur[-1].dir))
                 pitch = fr.pt_local(ln.origin).y - fr.pt_local(cur[-1].origin).y
             cur.append(ln)
         if cur:
@@ -412,21 +507,16 @@ def _dominant_span(spans: list[Span]) -> Span:
 
 
 def _block_frame(blk: Block) -> Optional[Frame]:
+    """Frame of a paragraph; None only if its lines run in different directions."""
     ang = _dir_angle(blk.lines[0].dir)
-    if ang is None:
-        return None
     for ln in blk.lines:
-        a = _dir_angle(ln.dir)
-        if a is None or abs(a - ang) > 1e-6:
+        if not _same_angle(_dir_angle(ln.dir), ang):
             return None
     return Frame(pivot=fitz.Point(blk.lines[0].origin), angle=ang)
 
 
-def _line_frame(ln: Line) -> Optional[Frame]:
-    ang = _dir_angle(ln.dir)
-    if ang is None:
-        return None
-    return Frame(pivot=fitz.Point(ln.origin), angle=ang)
+def _line_frame(ln: Line) -> Frame:
+    return Frame(pivot=fitz.Point(ln.origin), angle=_dir_angle(ln.dir))
 
 
 @dataclass
@@ -442,7 +532,7 @@ class LocalLine:
 def _local_lines(blk: Block, fr: Frame) -> list[LocalLine]:
     out = []
     for ln in blk.lines:
-        r = fr.rect_local(ln.bbox)
+        r = _lrect(fr, ln)
         o = fr.pt_local(ln.origin)
         out.append(LocalLine(line=ln, x0=r.x0, x1=r.x1, top=r.y0, baseline=o.y))
     return out
@@ -472,10 +562,89 @@ def _detect_align(lls: list[LocalLine], width_left: float, width_right: float) -
 # ─── Fonts ──────────────────────────────────────────────────────────────────
 
 
+def _has_ink(font: fitz.Font, ch: str) -> bool:
+    """Does the glyph draw anything? Subsets made by some producers (MuPDF's
+    own ``subset_fonts`` among them) keep the cmap and widths of every glyph
+    but empty the outlines of unused ones, so has_glyph() is not enough."""
+    try:
+        scratch = fitz.open()
+        pg = scratch.new_page(width=24, height=24)
+        tw = fitz.TextWriter(pg.rect)
+        tw.append((4, 18), ch, font=font, fontsize=16)
+        tw.write_text(pg)
+        ok = not pg.get_pixmap(alpha=False).is_unicolor
+        scratch.close()
+        return ok
+    except Exception:
+        return True
+
+
+def _glyph_ok(font: fitz.Font, ch: str) -> bool:
+    if ch.isspace():
+        return True
+    cp = ord(ch)
+    # some broken subsets map a code point to an empty glyph
+    if not font.has_glyph(cp) or font.glyph_advance(cp) <= 0:
+        return False
+    ink = getattr(font, "_te_ink", None)  # set on subset fonts only
+    if ink is None:
+        return True
+    if ch not in ink:
+        ink[ch] = _has_ink(font, ch)
+    return ink[ch]
+
+
+class FontStack:
+    """A primary (embedded, possibly subset) font plus a fallback used only for
+    the glyphs the primary lacks. Duck-types the parts of ``fitz.Font`` the
+    layout code uses; ``_segments`` splits text into single-font pieces."""
+
+    def __init__(self, primary: fitz.Font, fallback: fitz.Font):
+        self.primary = primary
+        self.fallback = fallback
+
+    def font_for(self, ch: str) -> fitz.Font:
+        return self.primary if _glyph_ok(self.primary, ch) else self.fallback
+
+    def segments(self, text: str) -> list[tuple[str, fitz.Font]]:
+        out: list[tuple[str, fitz.Font]] = []
+        for ch in text:
+            f = out[-1][1] if (ch.isspace() and out) else self.font_for(ch)
+            if out and out[-1][1] is f:
+                out[-1] = (out[-1][0] + ch, f)
+            else:
+                out.append((ch, f))
+        return out
+
+    def text_length(self, text: str, fontsize: float = 11) -> float:
+        return sum(f.text_length(t, fontsize=fontsize) for t, f in self.segments(text))
+
+    def glyph_advance(self, cp: int) -> float:
+        return self.font_for(chr(cp)).glyph_advance(cp)
+
+    def has_glyph(self, cp: int) -> int:
+        return self.primary.has_glyph(cp) or self.fallback.has_glyph(cp)
+
+    @property
+    def ascender(self) -> float:
+        return self.primary.ascender
+
+    @property
+    def descender(self) -> float:
+        return self.primary.descender
+
+
+def _segments(font, text: str) -> list[tuple[str, fitz.Font]]:
+    if isinstance(font, FontStack):
+        return font.segments(text)
+    return [(text, font)]
+
+
 @dataclass
 class FontChoice:
-    font: fitz.Font
+    font: Union[fitz.Font, FontStack]
     source: str  # "embedded:<name>" | "base14:<code>"
+    fallback: Optional[str] = None  # source of the per-glyph fallback, if any
 
 
 class FontResolver:
@@ -502,22 +671,31 @@ class FontResolver:
             name, ext, ftype, buf = self.doc.extract_font(xref)
             if buf and ext not in ("n/a", "") and ftype != "Type3":
                 font = fitz.Font(fontbuffer=buf)
+                if re.match(r"^[A-Z]{6}\+", name or ""):
+                    font._te_ink = {}  # subset: verify outlines before trusting a glyph
         except Exception:
             font = None
         self._cache[xref] = font
         return font
 
     @staticmethod
-    def covers(font: fitz.Font, text: str) -> bool:
-        for ch in set(text):
-            if ch.isspace():
-                continue
-            if not font.has_glyph(ord(ch)):
-                return False
-            # some broken subsets map a code point to an empty glyph
-            if font.glyph_advance(ord(ch)) <= 0:
-                return False
-        return True
+    def covers(font, text: str) -> bool:
+        if isinstance(font, FontStack):
+            return all(_glyph_ok(font.primary, ch) or _glyph_ok(font.fallback, ch) for ch in set(text))
+        return all(_glyph_ok(font, ch) for ch in set(text))
+
+    def _partial(self, partial: Optional[tuple], text: str, fb: FontChoice) -> Optional[FontChoice]:
+        """Embedded font for the glyphs it has + ``fb`` for the rest, if that
+        actually covers the text (otherwise mixing fonts buys nothing)."""
+        if partial is None:
+            return None
+        font, src = partial
+        chars = {ch for ch in text if not ch.isspace()}
+        have = {ch for ch in chars if _glyph_ok(font, ch)}
+        missing = chars - have
+        if not have or not missing or not self.covers(fb.font, "".join(missing)):
+            return None
+        return FontChoice(FontStack(font, fb.font), src, fallback=fb.source)
 
     def base14(self, fam: str, bold: bool, italic: bool) -> FontChoice:
         code = _BASE14[(fam, bold, italic)]
@@ -533,6 +711,7 @@ class FontResolver:
         generic_override = family not in (None, "original")
         want_fam = family if generic_override else o_fam
 
+        own_partial = sib_partial = None
         if not generic_override:
             # (a) the span's own font, if style is unchanged
             if want_bold == o_bold and want_italic == o_italic:
@@ -540,18 +719,26 @@ class FontResolver:
                 for xref, basefont, _fk, _st in self.entries:
                     if _norm_font(basefont) == target:
                         f = self._load(xref)
-                        if f is not None and self.covers(f, text):
+                        if f is None:
+                            continue
+                        if self.covers(f, text):
                             return FontChoice(f, f"embedded:{_strip_subset(basefont)}")
-            # (b) a sibling weight/style of the same family embedded in the doc
+                        own_partial = own_partial or (f, f"embedded:{_strip_subset(basefont)}")
+            # (b) a sibling weight/style (or another subset) of the same family
             fk = _family_key(span_font)
             if fk:
                 for xref, basefont, efk, (efam, ebold, eitalic) in self.entries:
                     if efk == fk and ebold == want_bold and eitalic == want_italic:
                         f = self._load(xref)
-                        if f is not None and self.covers(f, text):
+                        if f is None:
+                            continue
+                        if self.covers(f, text):
                             return FontChoice(f, f"embedded:{_strip_subset(basefont)}")
-        # (c) Base-14 equivalent
-        return self.base14(want_fam, want_bold, want_italic)
+                        sib_partial = sib_partial or (f, f"embedded:{_strip_subset(basefont)}")
+        # (c) Base-14 equivalent — for the whole run, or (per-glyph) only for
+        # the glyphs an embedded subset is missing
+        fb = self.base14(want_fam, want_bold, want_italic)
+        return self._partial(own_partial, text, fb) or self._partial(sib_partial, text, fb) or fb
 
 
 # ─── Redaction (text-only removal) ──────────────────────────────────────────
@@ -571,10 +758,19 @@ def _band_rect_local(chars_local: list[tuple[fitz.Point, fitz.Rect]], size: floa
     return fitz.Rect(x0 + eps, base - size * 0.45, x1 - eps, base - size * 0.2)
 
 
-def _remove_runs(page: fitz.Page, rects: list[fitz.Rect]) -> None:
-    """Remove the text under ``rects`` (unrotated page coords) only."""
-    rects = [r for r in rects if r and not r.is_empty]
-    if not rects:
+def _remove_runs(page: fitz.Page, rects: list) -> None:
+    """Remove the text under ``rects`` (unrotated page coords) only.
+
+    An item is a Rect (axis-aligned band) or a list of Quads (point quads
+    along slanted text, written as one annotation's /QuadPoints)."""
+    items = []
+    for r in rects:
+        if isinstance(r, list):
+            if r:
+                items.append(r)
+        elif r and not r.is_empty:
+            items.append(r)
+    if not items:
         return
     doc = page.parent
     # Stash redact annots placed by other tools so we do not burn them in.
@@ -582,8 +778,17 @@ def _remove_runs(page: fitz.Page, rects: list[fitz.Rect]) -> None:
     for annot in list(page.annots(types=[fitz.PDF_ANNOT_REDACT]) or []):
         stashed.append((fitz.Rect(annot.rect), doc.xref_object(annot.xref, compressed=False)))
         page.delete_annot(annot)
-    for r in rects:
-        page.add_redact_annot(r, fill=False)
+    tm = page.transformation_matrix
+    for r in items:
+        if not isinstance(r, list):
+            page.add_redact_annot(r, fill=False)
+            continue
+        box = fitz.Rect()
+        for q in r:
+            box |= q.rect
+        a = page.add_redact_annot(box, fill=False)
+        pts = " ".join(f"{(p * tm).x:.4f} {(p * tm).y:.4f}" for q in r for p in (q.ul, q.ur, q.ll, q.lr))
+        doc.xref_set_key(a.xref, "QuadPoints", f"[{pts}]")
     page.apply_redactions(
         images=fitz.PDF_REDACT_IMAGE_NONE,
         graphics=fitz.PDF_REDACT_LINE_ART_NONE,
@@ -597,47 +802,149 @@ def _remove_runs(page: fitz.Page, rects: list[fitz.Rect]) -> None:
             pass
 
 
-def _span_band(span: Span, fr: Frame, from_char: int = 0) -> Optional[fitz.Rect]:
-    loc = [(fr.pt_local(c.origin), fr.rect_local(c.bbox)) for c in span.chars[from_char:]]
-    band = _band_rect_local(loc, span.size)
-    return fr.rect_page(band) if band is not None else None
+def _span_band(span: Span, fr: Frame, from_char: int = 0):
+    """What to redact to remove ``span``: a thin x-height band (Rect) for text
+    along a page axis; for slanted text a tiny axis-aligned quad at the middle
+    of each glyph's x-height (MuPDF only tests a quad's bounding box, so a
+    rotated band would also catch glyphs of the neighbouring lines)."""
+    if fr.is_right:
+        loc = [(fr.pt_local(c.origin), fr.rect_local(c.bbox)) for c in span.chars[from_char:]]
+        band = _band_rect_local(loc, span.size)
+        return fr.rect_page(band) if band is not None else None
+    quads = []
+    for c in span.chars[from_char:]:
+        lr = _lrect(fr, c)
+        o = fr.pt_local(c.origin)
+        e = max(0.05, min(0.08 * span.size, lr.width / 4))
+        p = fr.pt_page(fitz.Point((lr.x0 + lr.x1) / 2, o.y - 0.33 * span.size))
+        quads.append(fitz.Rect(p.x - e, p.y - e, p.x + e, p.y + e).quad)
+    return quads or None
 
 
 # ─── Writing ────────────────────────────────────────────────────────────────
 
 
-def _write(page: fitz.Page, fr: Frame, runs: list[tuple[fitz.Point, str, fitz.Font, float, tuple]]):
-    """runs: (local origin, text, font, size, rgb), in reading order.
+@dataclass
+class Run:
+    """One piece of text to write, in a frame's local coordinates."""
+    origin: fitz.Point
+    text: str
+    font: Union[fitz.Font, FontStack]
+    size: float
+    rgb: tuple
+    hscale: float = 1.0  # Tz / 100
+    tc: float = 0.0      # extra advance after every glyph (points, final)
+    tw: float = 0.0      # extra advance after every space (points, final)
 
-    Consecutive runs of one colour share a TextWriter; a colour change starts a
-    new one. Writing strictly in order keeps the content stream in reading
-    order, so copy/paste and search see the words in the right sequence."""
-    tw, cur_rgb = None, None
+
+def _adv(font, text: str, size: float, hscale: float = 1.0, tc: float = 0.0, tw: float = 0.0) -> float:
+    """Advance width of ``text`` as it will be written (Tz, Tc, Tw applied)."""
+    if not text:
+        return 0.0
+    return hscale * font.text_length(text, fontsize=size) + tc * len(text) + tw * text.count(" ")
+
+
+def _write(page: fitz.Page, fr: Frame, runs: list):
+    """runs: Run objects (or (local origin, text, font, size, rgb) tuples), in
+    reading order.
+
+    Consecutive runs of one colour and horizontal scale share a TextWriter; a
+    change starts a new one. Writing strictly in order keeps the content
+    stream in reading order, so copy/paste and search see the words in the
+    right sequence. Runs with char/word spacing are placed glyph by glyph."""
+    tw, key = None, None
 
     def flush():
         if tw is not None:
-            tw.write_text(page, color=cur_rgb, morph=fr.morph)
+            tw.write_text(page, color=key[0], morph=fr.morph_scaled(key[1]))
 
-    for origin, text, font, size, rgb in runs:
-        if not text:
+    for r in runs:
+        if not isinstance(r, Run):
+            r = Run(*r)
+        if not r.text:
             continue
-        if tw is None or rgb != cur_rgb:
+        k = (r.rgb, round(r.hscale, 5))
+        if tw is None or k != key:
             flush()
-            tw, cur_rgb = fitz.TextWriter(page.rect), rgb
-        tw.append(fitz.Point(origin), text, font=font, fontsize=size)
+            tw, key = fitz.TextWriter(page.rect), k
+        _append_run(tw, fr, r)
     flush()
 
 
-def _reinsert_span_exact(span: Span, fr: Frame, font: fitz.Font, delta: fitz.Point,
+def _append_run(tw: fitz.TextWriter, fr: Frame, r: Run) -> None:
+    hs = r.hscale if r.hscale > 0 else 1.0
+    px = fr.pivot.x
+
+    def put(x: float, text: str, font: fitz.Font):
+        # the writer's morph scales x by ``hs`` around the pivot: pre-divide
+        tw.append(fitz.Point(px + (x - px) / hs, r.origin.y), text, font=font, fontsize=r.size)
+
+    x = r.origin.x
+    per_glyph = abs(r.tc) > 1e-6 or abs(r.tw) > 1e-6
+    for text, font in _segments(r.font, r.text):
+        if not per_glyph:
+            put(x, text, font)
+            x += hs * font.text_length(text, fontsize=r.size)
+            continue
+        for ch in text:
+            if not ch.isspace():
+                put(x, ch, font)
+            x += _adv(font, ch, r.size, hs, r.tc, r.tw)
+
+
+def _reinsert_span_exact(span: Span, fr: Frame, font, delta: fitz.Point,
                          runs: list, rgb: Optional[tuple] = None):
     """Re-insert every glyph at its original origin (+delta): keeps kerning,
-    tracking and justification spacing exactly."""
+    tracking, horizontal scaling and justification spacing exactly."""
     color = rgb if rgb is not None else _int_to_rgb(span.color)
     for ch in span.chars:
         if ch.c.isspace():
             continue
         o = fr.pt_local(ch.origin) + delta
-        runs.append((o, ch.c, font, span.size, color))
+        runs.append(Run(o, ch.c, font, span.size, color, hscale=span.hscale))
+
+
+# ─── Spacing (Tc / Tw) measurement ──────────────────────────────────────────
+
+# fonts whose metrics the Base-14 substitutes share, so measuring against the
+# substitute is meaningful even when the original is not embedded
+_METRIC_COMPAT = ("helvetica", "arial", "times", "courier", "liberation", "nimbus", "arimo",
+                  "tinos", "cousine")
+
+
+def _measure_spacing(spans: list[Span], fr: Frame, resolver: "FontResolver") -> tuple[float, float]:
+    """(tc, tw) in ems: extra advance per glyph and per space beyond the
+    font's natural advance (x hscale), from consecutive glyph origins.
+    Medians make it robust against kerning; tiny values snap to 0."""
+    d_chars: list[float] = []
+    d_spaces: list[float] = []
+    for sp in spans:
+        if len(sp.chars) < 2 or sp.size <= 0:
+            continue
+        choice = resolver.resolve(sp.font, sp.flags, sp.text)
+        if not (choice.source.startswith("embedded:") or
+                any(h in _norm_font(sp.font) for h in _METRIC_COMPAT)):
+            continue  # substitute metrics would masquerade as spacing
+        xs = [fr.pt_local(c.origin).x for c in sp.chars]
+        for i in range(len(sp.chars) - 1):
+            ch = sp.chars[i].c
+            base = choice.font.primary if isinstance(choice.font, FontStack) else choice.font
+            if ch == " " and not base.has_glyph(32):
+                continue
+            nat = sp.hscale * choice.font.glyph_advance(ord(ch)) * sp.size
+            d = (xs[i + 1] - xs[i] - nat) / sp.size
+            (d_spaces if ch == " " else d_chars).append(d)
+
+    def median(v):
+        v = sorted(v)
+        n = len(v)
+        return 0.0 if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2)
+
+    tc = median(d_chars) if len(d_chars) >= 3 else 0.0
+    tw = (median(d_spaces) - tc) if d_spaces else 0.0
+    tc = 0.0 if abs(tc) < 0.01 else max(-0.2, min(1.0, tc))
+    tw = 0.0 if abs(tw) < 0.04 else max(-0.3, min(2.0, tw))
+    return tc, tw
 
 
 # ─── Paragraph layout ───────────────────────────────────────────────────────
@@ -645,12 +952,12 @@ def _reinsert_span_exact(span: Span, fr: Frame, font: fitz.Font, delta: fitz.Poi
 
 def _free_bottom(blocks: list[Block], blk: Block, fr: Frame, page_bottom_local: float) -> float:
     """Lowest local y the block may grow to without hitting another block."""
-    me = fr.rect_local(blk.bbox)
+    me = _lrect(fr, blk)
     limit = page_bottom_local
     for other in blocks:
         if other.id == blk.id:
             continue
-        r = fr.rect_local(other.bbox)
+        r = _lrect(fr, other)
         if r.x1 <= me.x0 or r.x0 >= me.x1:
             continue  # different column
         if r.y0 >= me.y1 - 0.5:
@@ -660,12 +967,12 @@ def _free_bottom(blocks: list[Block], blk: Block, fr: Frame, page_bottom_local: 
 
 def _free_right(blocks: list[Block], blk: Block, fr: Frame, page_right_local: float) -> float:
     """Rightmost local x a single-line block may grow to without hitting a neighbour."""
-    me = fr.rect_local(blk.bbox)
+    me = _lrect(fr, blk)
     limit = page_right_local
     for other in blocks:
         if other.id == blk.id:
             continue
-        r = fr.rect_local(other.bbox)
+        r = _lrect(fr, other)
         if r.y1 <= me.y0 + 0.5 or r.y0 >= me.y1 - 0.5:
             continue  # different row
         if r.x0 >= me.x1 - 0.5:
@@ -821,15 +1128,30 @@ def _restyle_tokens(orig, new_text: str):
 @dataclass
 class _Item:
     text: str
-    font: fitz.Font
+    font: Union[fitz.Font, FontStack]
     size: float
     rgb: tuple
+    hscale: float = 1.0
+    tc: float = 0.0  # ems
+    tw: float = 0.0  # ems
+
+    def run_args(self, f: float = 1.0) -> dict:
+        return {"hscale": self.hscale, "tc": self.tc * self.size * f, "tw": self.tw * self.size * f}
+
+    def adv(self, text: str, f: float = 1.0) -> float:
+        return _adv(self.font, text, self.size * f, **self.run_args(f))
 
     def width(self, f: float = 1.0) -> float:
-        return self.font.text_length(self.text, fontsize=self.size * f)
+        return self.adv(self.text, f)
 
     def space(self, f: float = 1.0) -> float:
-        return self.font.text_length(" ", fontsize=self.size * f)
+        return self.adv(" ", f)
+
+    def with_text(self, text: str) -> "_Item":
+        return _Item(text, self.font, self.size, self.rgb, self.hscale, self.tc, self.tw)
+
+    def style_key(self) -> tuple:
+        return (id(self.font), self.size, self.rgb, self.hscale, self.tc, self.tw)
 
 
 def _wrap_items(items: list[Optional[_Item]], width: float, f: float) -> list[tuple[list[_Item], bool]]:
@@ -852,9 +1174,9 @@ def _wrap_items(items: list[Optional[_Item]], width: float, f: float) -> list[tu
             rest = it.text
             while rest:
                 n = len(rest)
-                while n > 1 and it.font.text_length(rest[:n], fontsize=it.size * f) > width + 0.01:
+                while n > 1 and it.adv(rest[:n], f) > width + 0.01:
                     n -= 1
-                piece = _Item(rest[:n], it.font, it.size, it.rgb)
+                piece = it.with_text(rest[:n])
                 rest = rest[n:]
                 if rest:
                     lines.append(([piece], False))
@@ -867,14 +1189,85 @@ def _wrap_items(items: list[Optional[_Item]], width: float, f: float) -> list[tu
     return lines
 
 
+class OverflowError422(Exception):
+    """Raised before anything is written when an edit cannot fit."""
+
+    def __init__(self, info: dict):
+        super().__init__("overflow")
+        self.info = info
+
+
+FOOTER_ZONE = 0.07   # bottom fraction of the page whose blocks are never pushed
+PUSH_MARGIN = 18.0   # pushed text must stay this far above the page edge
+MIN_FIT_SCALE = 0.25  # "shrink to fit" never goes below 25% ...
+MIN_FIT_SIZE = 3.0    # ... or 3pt
+
+
+def _plan_push(blocks: list[Block], blk: Block, fr: Frame, x0: float, x1: float,
+               old_bottom: float, delta: float, page_local: fitz.Rect) -> Optional[list[Block]]:
+    """Blocks to move down by ``delta`` (local y) so the grown paragraph fits,
+    or None when there is no room on the page.
+
+    Followers are the blocks below the paragraph in its column (horizontal
+    overlap), closed transitively (a pushed block pushes what is under it).
+    Blocks in the footer zone are obstacles, never followers. Every follower
+    must keep clear of all other blocks and of the page bottom margin."""
+    zone_top = page_local.y1 - FOOTER_ZONE * page_local.height
+    rects = {b.id: _lrect(fr, b) for b in blocks if b.id != blk.id}
+    same_dir = {b.id for b in blocks if b.id != blk.id and (bf := _block_frame(b)) is not None
+                and _same_angle(bf.angle, fr.angle)}
+    followers: dict[str, fitz.Rect] = {}
+    spans_x = [(x0, x1, old_bottom)]
+    changed = True
+    while changed:
+        changed = False
+        for bid, r in rects.items():
+            if bid in followers or r.y0 >= zone_top:
+                continue
+            for sx0, sx1, sy in spans_x:
+                if r.x1 > sx0 + 0.5 and r.x0 < sx1 - 0.5 and r.y0 >= sy - 0.5:
+                    if bid not in same_dir:
+                        return None  # a block we cannot re-insert would be overrun
+                    followers[bid] = r
+                    spans_x.append((r.x0, r.x1, r.y1))
+                    changed = True
+                    break
+    if not followers:
+        return None
+    bottom_limit = page_local.y1 - PUSH_MARGIN
+    grown = fitz.Rect(x0, old_bottom - 0.5, x1, old_bottom + delta)
+    if grown.y1 > bottom_limit:
+        return None
+    for oid, o in rects.items():
+        if oid not in followers and o.y0 >= old_bottom - 0.5:
+            inter = grown & o
+            if not inter.is_empty and inter.height >= 0.5 and inter.width >= 0.5:
+                return None
+    for bid, r in followers.items():
+        moved = fitz.Rect(r.x0, r.y0 + delta, r.x1, r.y1 + delta)
+        if moved.y1 > max(bottom_limit, r.y1):
+            return None
+        for oid, o in rects.items():
+            if oid in followers:
+                continue
+            if (moved & o).is_empty or (moved & o).height < 0.5 or (moved & o).width < 0.5:
+                continue
+            if not (r & o).is_empty and (r & o).height >= 0.5:
+                continue  # already overlapping before: not made worse by us
+            return None
+    return [b for b in blocks if b.id in followers]
+
+
 def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver", text: Optional[str],
-                    fam, size_o, rgb_o, bold_o, italic_o, align_o) -> dict:
+                    fam, size_o, rgb_o, bold_o, italic_o, align_o, overflow_mode: str = "auto",
+                    before_write=None) -> dict:
     lls = _local_lines(blk, fr)
-    local_bbox = fr.rect_local(blk.bbox)
+    local_bbox = _lrect(fr, blk)
     dom = _dominant_span(blk.spans)
     orig = _paragraph_tokens(lls, local_bbox.x1)
     new_text = _tokens_text(orig) if text is None else text
     toks = _restyle_tokens(orig, new_text)
+    align = align_o or _detect_align(lls, 0, 0)
 
     # resolve one font per original style (checked against all its new words)
     groups: dict[tuple, list[str]] = {}
@@ -883,17 +1276,23 @@ def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver
             sp = sp or dom
             groups.setdefault((sp.font, sp.flags), []).append(w)
     fonts: dict[tuple, FontChoice] = {}
+    spacing: dict[tuple, tuple[float, float]] = {}
     for (fname, flags), words in groups.items():
         fonts[(fname, flags)] = resolver.resolve(fname, flags, "".join(words), family=fam,
                                                  bold=bold_o, italic=italic_o)
+        tc, tw = _measure_spacing([s for s in blk.spans if (s.font, s.flags) == (fname, flags)], fr, resolver)
+        if align == "justify":
+            tw = 0.0  # justified gaps are recomputed by the layout
+        spacing[(fname, flags)] = (tc, tw)
     items: list[Optional[_Item]] = []
     for w, sp in toks:
         if w == NL:
             items.append(None)
             continue
         sp = sp or dom
+        tc, tw = spacing[(sp.font, sp.flags)]
         items.append(_Item(w, fonts[(sp.font, sp.flags)].font, size_o or sp.size,
-                           rgb_o or _int_to_rgb(sp.color)))
+                           rgb_o or _int_to_rgb(sp.color), sp.hscale, tc, tw))
 
     x0 = min(l.x0 for l in lls)
     width = max(local_bbox.x1 - x0, 1.0)
@@ -906,7 +1305,6 @@ def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver
         dfont = fonts[(dom.font, dom.flags)].font if (dom.font, dom.flags) in fonts else fitz.Font("helv")
         pitch_ratio = max(1.15, dfont.ascender - dfont.descender)
     pitch_ratio = max(pitch_ratio, 0.8)
-    align = align_o or _detect_align(lls, 0, 0)
     page_local = fr.rect_local(page.rect)
     if len(lls) == 1 and align == "left":
         # A one-line block behaves like Acrobat point text: when the new text is
@@ -929,18 +1327,76 @@ def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver
         desc = max((-it.font.descender * it.size * f for it in last), default=0.25 * base_size * f)
         return lines, baselines, baselines[-1] + desc
 
+    def fits(b: float) -> bool:
+        return b <= limit + 0.5
+
     f = 1.0
     lines, baselines, bottom = layout(f)
-    if bottom > limit + 0.5:
+    full_bottom = bottom  # at the requested size
+    pushed: list[Block] = []
+    push_delta = 0.0
+    overlap = False
+    if not fits(bottom):
+        # 1. shrink a little (to 85%)
         while f > MIN_SHRINK + 1e-6:
             f = max(MIN_SHRINK, f - 0.025)
             lines, baselines, bottom = layout(f)
-            if bottom <= limit + 0.5:
+            if fits(bottom):
                 break
-    overflow = bottom > limit + 0.5
+    if not fits(bottom):
+        plan = None
+        if overflow_mode == "auto":
+            # 2. keep the 85% size and push the blocks below down by what is
+            # still missing (if the page has room)
+            push_delta = bottom - local_bbox.y1
+            plan = _plan_push(blocks, blk, fr, x0, x0 + width, local_bbox.y1, push_delta, page_local)
+        if plan:
+            pushed = plan
+        else:
+            push_delta = 0.0
+            # largest scale that fits without pushing
+            fit_f, fit_b = None, None
+            g = MIN_SHRINK
+            min_f = max(MIN_FIT_SCALE, MIN_FIT_SIZE / base_size if base_size else MIN_FIT_SCALE)
+            while g > min_f + 1e-9:
+                g = max(min_f, round(g - 0.01, 4))
+                ls, bs, b = layout(g)
+                if fits(b):
+                    fit_f, fit_b = g, (ls, bs, b)
+                    break
+            if overflow_mode == "shrink" and fit_b is not None:
+                f = fit_f
+                lines, baselines, bottom = fit_b
+            elif overflow_mode == "allow":
+                f = 1.0
+                lines, baselines, bottom = layout(f)
+                overlap = True
+            else:
+                raise OverflowError422({
+                    "code": "overflow",
+                    "message": "The edited text does not fit: there is no room below to push the "
+                               "following text down",
+                    "needed_height": round(full_bottom - top, 2),
+                    "available_height": round(limit - top, 2),
+                    "requested_size": round(base_size, 2),
+                    "fit_size": round(base_size * fit_f, 2) if fit_f is not None else None,
+                    "fit_scale": round(fit_f, 3) if fit_f is not None else None,
+                })
 
-    _remove_runs(page, [b for l in blk.lines for s in l.spans if (b := _span_band(s, fr)) is not None])
-    runs = []
+    if before_write is not None:
+        before_write()
+
+    bands = [b for l in blk.lines for s in l.spans if (b := _span_band(s, fr)) is not None]
+    push_frames = []
+    if pushed:
+        vec = fr.pt_page(fr.pivot + (0, push_delta)) - fr.pivot  # page-space vector
+        for pb in pushed:
+            for pl in pb.lines:
+                lf = _line_frame(pl)
+                push_frames.append((pl, lf, lf.pt_local(lf.pivot + vec) - lf.pivot))
+                bands += [b for s in pl.spans if (b := _span_band(s, lf)) is not None]
+    _remove_runs(page, bands)
+    runs: list[Run] = []
     for (ln_items, para_end), y in zip(lines, baselines):
         if not ln_items:
             continue
@@ -951,7 +1407,7 @@ def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver
             gap = (width - words_w) / (len(ln_items) - 1)
             x = x0
             for it in ln_items:
-                runs.append((fitz.Point(x, y), it.text, it.font, it.size * f, it.rgb))
+                runs.append(Run(fitz.Point(x, y), it.text, it.font, it.size * f, it.rgb, **it.run_args(f)))
                 x += it.width(f) + gap
             continue
         if align == "center":
@@ -965,18 +1421,22 @@ def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver
         while i < len(ln_items):
             j = i
             txt = ln_items[i].text
-            while j + 1 < len(ln_items) and (ln_items[j + 1].font, ln_items[j + 1].size, ln_items[j + 1].rgb) == \
-                    (ln_items[i].font, ln_items[i].size, ln_items[i].rgb):
+            while j + 1 < len(ln_items) and ln_items[j + 1].style_key() == ln_items[i].style_key():
                 j += 1
                 txt += " " + ln_items[j].text
             it = ln_items[i]
-            runs.append((fitz.Point(x, y), txt, it.font, it.size * f, it.rgb))
-            x += it.font.text_length(txt, fontsize=it.size * f)
+            runs.append(Run(fitz.Point(x, y), txt, it.font, it.size * f, it.rgb, **it.run_args(f)))
+            x += it.adv(txt, f)
             if j + 1 < len(ln_items):
                 x += ln_items[j].space(f)
             i = j + 1
     _write(page, fr, runs)
-    used = {fc.source for fc in fonts.values()}
+    for pl, lf, lvec in push_frames:
+        pruns: list = []
+        for s in pl.spans:
+            _reinsert_span_exact(s, lf, resolver.resolve(s.font, s.flags, s.text).font, lvec, pruns)
+        _write(page, lf, pruns)
+    used = {fc.source for fc in fonts.values()} | {fc.fallback for fc in fonts.values() if fc.fallback}
     return {
         "font": fonts[(dom.font, dom.flags)].source if (dom.font, dom.flags) in fonts else sorted(used)[0],
         "fonts": sorted(used),
@@ -984,8 +1444,13 @@ def _edit_paragraph(page, blocks, blk: Block, fr: Frame, resolver: "FontResolver
         "requested_size": round(base_size, 2),
         "scale": round(f, 3),
         "lines": len(lines),
-        "overflow": overflow,
+        # overflow: the text extends past the space it had (it pushed the
+        # following text down, or overlaps it); overlap: it covers other text
+        "overflow": not fits(bottom),
+        "overlap": overlap,
         "align": align,
+        "pushed": len(pushed),
+        "push_distance": round(push_delta, 2) if pushed else 0.0,
     }
 
 
@@ -1012,6 +1477,10 @@ class EditRequest(BaseModel):
     text: Optional[str] = None
     style: Optional[StyleOverride] = None
     align: Optional[Literal["left", "center", "right", "justify"]] = None
+    # paragraph edits that do not fit: "auto" = shrink to 85% / push the text
+    # below down, else 422; "shrink" = shrink as far as needed; "allow" =
+    # write at the requested size and let it overlap
+    overflow: Literal["auto", "shrink", "allow"] = "auto"
 
 
 class MoveRequest(BaseModel):
@@ -1045,7 +1514,18 @@ def _style_dict(sp: Span) -> dict:
         "bold": bold,
         "italic": italic,
         "flags": sp.flags,
+        "hscale": round(sp.hscale, 4),
     }
+
+
+def _box_json(page: fitz.Page, fr: Frame, obj) -> dict:
+    """The text's own (possibly rotated) box in visible space: top-left corner
+    (x, y), width/height along/across the text direction, and the clockwise
+    angle — i.e. CSS ``transform: rotate(angle deg)`` with origin top-left."""
+    lr = _lrect(fr, obj)
+    tl = fr.pt_page(lr.tl) * page.rotation_matrix
+    return {"x": round(tl.x, 3), "y": round(tl.y, 3), "w": round(lr.width, 3), "h": round(lr.height, 3),
+            "angle": round((fr.angle + page.rotation) % 360, 4)}
 
 
 def _block_json(page: fitz.Page, blk: Block, page_rot: int) -> dict:
@@ -1063,7 +1543,7 @@ def _block_json(page: fitz.Page, blk: Block, page_rot: int) -> dict:
         "angle": None,
     }
     if fr is None:
-        out.update(reason="Text at a non-right angle cannot be edited in place",
+        out.update(reason="Lines of this paragraph run in different directions; edit them one line at a time",
                    paragraph_text=blk.text, align="left", line_height=1.2)
     else:
         lls = _local_lines(blk, fr)
@@ -1075,16 +1555,25 @@ def _block_json(page: fitz.Page, blk: Block, page_rot: int) -> dict:
             paragraph_text=_tokens_text(_paragraph_tokens(lls, bx1)),
             align=_detect_align(lls, 0, 0),
             line_height=round(pitch / dom.size, 3) if pitch and dom.size else 1.2,
-            angle=(fr.angle + page_rot) % 360,
+            angle=round((fr.angle + page_rot) % 360, 4),
+            box=_box_json(page, fr, blk),
         )
-    out["lines"] = [{
-        "id": ln.id,
-        "bbox": _vis(page, ln.bbox),
-        "text": ln.text,
-        "style": _style_dict(_dominant_span(ln.spans)),
-        "spans": [{"id": sp.id, "bbox": _vis(page, sp.bbox), "text": sp.text, **_style_dict(sp)}
-                  for sp in ln.spans],
-    } for ln in blk.lines]
+    lines = []
+    for ln in blk.lines:
+        lf = _line_frame(ln)
+        lines.append({
+            "id": ln.id,
+            "bbox": _vis(page, ln.bbox),
+            "text": ln.text,
+            "style": _style_dict(_dominant_span(ln.spans)),
+            "editable": True,
+            "angle": round((lf.angle + page_rot) % 360, 4),
+            "box": _box_json(page, lf, ln),
+            "spans": [{"id": sp.id, "bbox": _vis(page, sp.bbox), "text": sp.text,
+                       "box": _box_json(page, lf, sp), **_style_dict(sp)}
+                      for sp in ln.spans],
+        })
+    out["lines"] = lines
     return out
 
 
@@ -1149,68 +1638,72 @@ async def edit_text_in_place(doc_id: str, req: EditRequest):
 
     resolver = FontResolver(doc, page)
     result: dict = {"status": "ok", "kind": req.target.kind}
+    try:
+        if req.target.kind == "block":
+            fr = _block_frame(blk)
+            if fr is None:
+                raise HTTPException(status_code=422, detail="Lines of this paragraph run in different "
+                                                            "directions; edit them one line at a time")
+            try:
+                result.update(_edit_paragraph(page, blocks, blk, fr, resolver, text,
+                                              fam, size_o, rgb_o, bold_o, italic_o, req.align,
+                                              overflow_mode=req.overflow,
+                                              before_write=lambda: snapshot(doc_id, "Edit text block")))
+            except OverflowError422 as e:
+                raise HTTPException(status_code=422, detail=e.info)
 
-    if req.target.kind == "block":
-        fr = _block_frame(blk)
-        if fr is None:
-            doc.close()
-            raise HTTPException(status_code=422, detail="Text at a non-right angle cannot be edited in place")
-        snapshot(doc_id, "Edit text block")
-        result.update(_edit_paragraph(page, blocks, blk, fr, resolver, text,
-                                      fam, size_o, rgb_o, bold_o, italic_o, req.align))
+        elif req.target.kind == "line":
+            fr = _line_frame(ln)
+            dom = _dominant_span(ln.spans)
+            if text is not None and "\n" in text:
+                text = text.replace("\n", " ")
+            if text is None and not has_style:
+                # alignment-only change on a single line is a no-op
+                doc.close()
+                return {"status": "ok", "kind": "line", "changed": False}
+            snapshot(doc_id, "Edit text line")
+            size = size_o or dom.size
+            rgb = rgb_o or _int_to_rgb(dom.color)
+            # restyle keeps the text (mixed styles collapse to the override)
+            new_text = ln.text if text is None else text
+            choice = resolver.resolve(dom.font, dom.flags, new_text, family=fam, bold=bold_o, italic=italic_o)
+            tc, tw = _measure_spacing(ln.spans, fr, resolver)
+            origin = fr.pt_local(ln.origin)
+            _remove_runs(page, [b for s in ln.spans if (b := _span_band(s, fr)) is not None])
+            _write(page, fr, [Run(origin, new_text, choice.font, size, rgb, dom.hscale, tc * size, tw * size)])
+            result.update(font=choice.source, font_size=round(size, 2), fallback=choice.fallback)
 
-    elif req.target.kind == "line":
-        fr = _line_frame(ln)
-        if fr is None:
+        else:  # span: rewrite this span and shift the rest of the line
+            fr = _line_frame(ln)
+            snapshot(doc_id, "Edit text")
+            new_text = sp.text if text is None else text.replace("\n", " ")
+            size = size_o or sp.size
+            rgb = rgb_o or _int_to_rgb(sp.color)
+            choice = resolver.resolve(sp.font, sp.flags, new_text, family=fam, bold=bold_o, italic=italic_o)
+            tc, tw = _measure_spacing([s for s in ln.spans if (s.font, s.flags) == (sp.font, sp.flags)], fr, resolver)
+            tc, tw = tc * size, tw * size
+            idx = ln.spans.index(sp)
+            following = ln.spans[idx + 1:]
+            o_local = fr.pt_local(sp.origin)
+            old_end = _lrect(fr, sp).x1
+            # trailing whitespace advances are not in the glyph bbox; keep them.
+            # The last glyph's Tc is not in the bbox either.
+            new_width = _adv(choice.font, new_text, size, sp.hscale, tc, tw) - (tc if new_text else 0.0)
+            new_end = o_local.x + new_width
+            shift = fitz.Point(new_end - old_end, 0)
+            bands = [_span_band(sp, fr)] + [_span_band(s, fr) for s in following]
+            _remove_runs(page, [b for b in bands if b is not None])
+            runs = [Run(o_local, new_text, choice.font, size, rgb, sp.hscale, tc, tw)]
+            for s in following:
+                fch = resolver.resolve(s.font, s.flags, s.text)
+                _reinsert_span_exact(s, fr, fch.font, shift, runs)
+            _write(page, fr, runs)
+            result.update(font=choice.source, font_size=round(size, 2), shifted=round(shift.x, 3),
+                          fallback=choice.fallback)
+    except BaseException:
+        if not doc.is_closed:
             doc.close()
-            raise HTTPException(status_code=422, detail="Text at a non-right angle cannot be edited in place")
-        snapshot(doc_id, "Edit text line")
-        dom = _dominant_span(ln.spans)
-        if text is not None and "\n" in text:
-            text = text.replace("\n", " ")
-        if text is None and not has_style:
-            # alignment-only change on a single line is a no-op
-            doc.close()
-            return {"status": "ok", "kind": "line", "changed": False}
-        size = size_o or dom.size
-        rgb = rgb_o or _int_to_rgb(dom.color)
-        if text is None:
-            # restyle every span, keep their text (mixed styles collapse to override)
-            new_text = ln.text
-        else:
-            new_text = text
-        choice = resolver.resolve(dom.font, dom.flags, new_text, family=fam, bold=bold_o, italic=italic_o)
-        origin = fr.pt_local(ln.origin)
-        _remove_runs(page, [b for s in ln.spans if (b := _span_band(s, fr)) is not None])
-        _write(page, fr, [(origin, new_text, choice.font, size, rgb)])
-        result.update(font=choice.source, font_size=round(size, 2))
-
-    else:  # span: rewrite this span and shift the rest of the line
-        fr = _line_frame(ln)
-        if fr is None:
-            doc.close()
-            raise HTTPException(status_code=422, detail="Text at a non-right angle cannot be edited in place")
-        snapshot(doc_id, "Edit text")
-        new_text = sp.text if text is None else text.replace("\n", " ")
-        size = size_o or sp.size
-        rgb = rgb_o or _int_to_rgb(sp.color)
-        choice = resolver.resolve(sp.font, sp.flags, new_text, family=fam, bold=bold_o, italic=italic_o)
-        idx = ln.spans.index(sp)
-        following = ln.spans[idx + 1:]
-        o_local = fr.pt_local(sp.origin)
-        old_end = fr.rect_local(sp.bbox).x1
-        # trailing whitespace advances are not in the glyph bbox; keep them
-        new_width = choice.font.text_length(new_text, fontsize=size)
-        new_end = o_local.x + new_width
-        shift = fitz.Point(new_end - old_end, 0)
-        bands = [_span_band(sp, fr)] + [_span_band(s, fr) for s in following]
-        _remove_runs(page, [b for b in bands if b is not None])
-        runs = [(o_local, new_text, choice.font, size, rgb)]
-        for s in following:
-            fch = resolver.resolve(s.font, s.flags, s.text)
-            _reinsert_span_exact(s, fr, fch.font, shift, runs)
-        _write(page, fr, runs)
-        result.update(font=choice.source, font_size=round(size, 2), shifted=round(shift.x, 3))
+        raise
 
     _save_in_place(doc, path)
     return result
@@ -1236,13 +1729,7 @@ async def move_text(doc_id: str, req: MoveRequest):
         doc.close()
         raise HTTPException(status_code=400, detail="Destination is outside the page")
 
-    frames = []
-    for l in lines:
-        fr = _line_frame(l)
-        if fr is None:
-            doc.close()
-            raise HTTPException(status_code=422, detail="Text at a non-right angle cannot be moved")
-        frames.append(fr)
+    frames = [_line_frame(l) for l in lines]
 
     snapshot(doc_id, "Move text")
     resolver = FontResolver(doc, page)
@@ -1273,11 +1760,7 @@ async def delete_text(doc_id: str, req: DeleteRequest):
         spans_lines = [(sp, ln)]
     bands = []
     for s, l in spans_lines:
-        fr = _line_frame(l)
-        if fr is None:
-            doc.close()
-            raise HTTPException(status_code=422, detail="Text at a non-right angle cannot be deleted in place")
-        b = _span_band(s, fr)
+        b = _span_band(s, _line_frame(l))
         if b is not None:
             bands.append(b)
     snapshot(doc_id, "Delete text")

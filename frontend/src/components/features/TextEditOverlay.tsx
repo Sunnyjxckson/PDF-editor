@@ -27,8 +27,9 @@ import {
 } from "lucide-react";
 import {
   buildEditPayload, cssFontFamily, deleteText, editTextInPlace, getEditableText, initialDraft,
-  moveText, ptRectToPx, pxDeltaToPt,
-  type Draft, type EditableBlock, type EditablePage, type FamilyChoice, type TargetKind,
+  isUpright, moveText, overflowChoices, ptRectToPx, pxDeltaToPt, rotBoxToCss, TextOverflowError,
+  type Draft, type EditPayload, type EditResult, type EditablePage, type FamilyChoice,
+  type OverflowInfo, type OverflowMode, type RotBox, type TargetKind,
   type TextAlign, type TextStyle, type TextTarget,
 } from "@/lib/features/text_edit";
 
@@ -63,6 +64,21 @@ interface Selectable {
   editable: boolean;
   reason?: string;
   mixed: boolean;
+  /** The text's own rotated box (absent on old servers / unknown geometry). */
+  box?: RotBox;
+}
+
+/** Rotated box when the text is not upright, else null (use the bbox). */
+function tilted(it: Selectable): RotBox | null {
+  return it.box && !isUpright(it.box.angle) ? it.box : null;
+}
+
+/** Toast text for a successful edit, from the server's layout report. */
+export function editResultMessage(res: Pick<EditResult, "pushed" | "overlap" | "overflow">): string | null {
+  if (res.pushed) return `Moved the following text down to make room`;
+  if (res.overlap) return "Text overlaps the text below (as requested)";
+  if (res.overflow) return "Text did not fit in the original box; it extends below it";
+  return null;
 }
 
 function flatten(page: EditablePage | null, gran: TextEditGranularity): Selectable[] {
@@ -73,24 +89,26 @@ function flatten(page: EditablePage | null, gran: TextEditGranularity): Selectab
       out.push({
         kind: "block", id: b.id, bbox: b.bbox, text: b.text, style: b.style,
         paragraph_text: b.paragraph_text, align: b.align, line_height: b.line_height,
-        editable: b.editable, reason: b.reason, mixed: b.mixed_styles,
+        editable: b.editable, reason: b.reason, mixed: b.mixed_styles, box: b.box,
       });
       continue;
     }
     for (const l of b.lines) {
       if (gran === "line") {
+        const editable = l.editable ?? b.editable;
         out.push({
           kind: "line", id: l.id, bbox: l.bbox, text: l.text, style: l.style, line_height: 1.2,
-          editable: b.editable, reason: b.reason, mixed: l.spans.length > 1,
+          editable, reason: editable ? undefined : b.reason, mixed: l.spans.length > 1, box: l.box,
         });
         continue;
       }
       for (const s of l.spans) {
         if (!s.text.trim()) continue;
-        const { id, bbox, text, ...style } = s;
+        const { id, bbox, text, box, ...style } = s;
+        const editable = l.editable ?? b.editable;
         out.push({
           kind: "span", id, bbox, text, style: style as TextStyle, line_height: 1.2,
-          editable: b.editable, reason: b.reason, mixed: false,
+          editable, reason: editable ? undefined : b.reason, mixed: false, box,
         });
       }
     }
@@ -121,6 +139,10 @@ export default function TextEditOverlay({
   const [error, setError] = useState<string | null>(null);
   const [drag, setDrag] = useState<{ x: number; y: number; dx: number; dy: number; zoom: number } | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
+  // a paragraph edit the server could not fit (422): offer shrink / overlap / cancel
+  const [overflow, setOverflow] = useState<{ info: OverflowInfo; payload: EditPayload } | null>(null);
+  const overflowRef = useRef<typeof overflow>(null);
+  overflowRef.current = overflow;
   const committingRef = useRef(false);
   // An edit "session" is one open editor. Async handlers read state through
   // these refs, so a late blur/click from a closed editor can never resend.
@@ -147,14 +169,16 @@ export default function TextEditOverlay({
   }, [docId, currentPage, active, refreshKey, reloadTick]);
 
   // leaving the page / mode drops any open editor
-  useEffect(() => { setEditing(null); setDraft(null); setOriginal(null); setError(null); }, [docId, currentPage, active]);
+  useEffect(() => {
+    setEditing(null); setDraft(null); setOriginal(null); setError(null); setOverflow(null);
+  }, [docId, currentPage, active]);
 
   const items = useMemo(() => flatten(page, gran), [page, gran]);
 
   // ─── editor lifecycle ─────────────────────────────────────────────────
   const close = useCallback(() => {
     sessionRef.current = 0;
-    setEditing(null); setDraft(null); setOriginal(null); setError(null); setDrag(null);
+    setEditing(null); setDraft(null); setOriginal(null); setError(null); setDrag(null); setOverflow(null);
   }, []);
 
   const open = (it: Selectable) => {
@@ -177,25 +201,27 @@ export default function TextEditOverlay({
 
   const target = (it: Selectable): TextTarget => ({ kind: it.kind, id: it.id, bbox: it.bbox });
 
-  const afterChange = useCallback((msg?: string, overflow?: boolean) => {
+  const afterChange = useCallback((msg?: string, res?: EditResult) => {
     onDocumentChanged();
-    if (overflow) onMessage?.("Text did not fit in the original box; it extends below it", "info");
+    const layoutMsg = res ? editResultMessage(res) : null;
+    if (layoutMsg) onMessage?.(layoutMsg, "info");
     else if (msg) onMessage?.(msg, "success");
     setReloadTick((t) => t + 1);
     close();
   }, [close, onDocumentChanged, onMessage]);
 
-  const commit = useCallback(async () => {
-    const editing = editingRef.current, draft = draftRef.current, original = originalRef.current;
-    if (!sessionRef.current || !editing || !draft || !original || committingRef.current) return;
-    const payload = buildEditPayload(currentPage, target(editing), original, draft);
-    if (!payload) { close(); return; }
+  const send = useCallback(async (payload: EditPayload) => {
     committingRef.current = true;
     setSaving(true); setError(null);
     try {
       const res = await editTextInPlace(docId, payload);
-      afterChange(undefined, res.overflow);
+      afterChange(undefined, res);
     } catch (e: unknown) {
+      if (e instanceof TextOverflowError) {
+        // nothing was written: let the user pick how to resolve it
+        setOverflow({ info: e.info, payload });
+        return;
+      }
       const msg = e instanceof Error ? e.message : "Text edit failed";
       setError(msg);
       onMessage?.(msg, "error");
@@ -204,7 +230,23 @@ export default function TextEditOverlay({
       setSaving(false);
       committingRef.current = false;
     }
-  }, [currentPage, docId, close, afterChange, onMessage]);
+  }, [docId, afterChange, onMessage]);
+
+  const commit = useCallback(async () => {
+    const editing = editingRef.current, draft = draftRef.current, original = originalRef.current;
+    if (!sessionRef.current || !editing || !draft || !original || committingRef.current) return;
+    if (overflowRef.current) return; // waiting for the user's overflow choice
+    const payload = buildEditPayload(currentPage, target(editing), original, draft);
+    if (!payload) { close(); return; }
+    await send(payload);
+  }, [currentPage, close, send]);
+
+  const resolveOverflow = (mode: OverflowMode | null) => {
+    const pending = overflowRef.current;
+    setOverflow(null);
+    if (!pending || !mode) { textareaRef.current?.focus(); return; }
+    void send({ ...pending.payload, overflow: mode });
+  };
 
   const remove = async () => {
     if (!sessionRef.current || !editing || committingRef.current) return;
@@ -257,6 +299,7 @@ export default function TextEditOverlay({
 
   // ─── keyboard / blur ──────────────────────────────────────────────────
   const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Escape" && overflow) { e.preventDefault(); resolveOverflow(null); return; }
     if (e.key === "Escape") { e.preventDefault(); close(); return; }
     if (e.key === "Enter" && !(editing?.kind === "block" && e.shiftKey)) {
       e.preventDefault(); void commit(); return;
@@ -270,7 +313,7 @@ export default function TextEditOverlay({
   const onEditorBlur = (e: ReactFocusEvent<HTMLDivElement>) => {
     const next = e.relatedTarget as Node | null;
     if (next && editorRef.current?.contains(next)) return; // moving within the editor/format bar
-    if (drag) return;
+    if (drag || overflowRef.current) return;
     void commit();
   };
 
@@ -286,6 +329,7 @@ export default function TextEditOverlay({
 
   // ─── render ───────────────────────────────────────────────────────────
   const editorBox = editing ? ptRectToPx(editing.bbox, pxPerPt) : null;
+  const editTilt = editing ? tilted(editing) : null;
   const textStyle: CSSProperties | undefined = editing && draft ? {
     fontFamily: cssFontFamily(draft.family as FamilyChoice, editing.style.family),
     fontSize: `${draft.size * pxPerPt}px`,
@@ -317,8 +361,13 @@ export default function TextEditOverlay({
       {/* hover / click targets */}
       {items.map((it) => {
         if (editing && editing.id === it.id) return null;
+        const tb = tilted(it);
         const r = ptRectToPx(it.bbox, pxPerPt);
         const hot = hoverId === it.id;
+        const geom: CSSProperties = tb
+          ? (({ left, top, width, height, transform, transformOrigin }) =>
+              ({ left, top, width, height, transform, transformOrigin }))(rotBoxToCss(tb, pxPerPt, 1))
+          : { left: r.left - 1, top: r.top - 1, width: r.width + 2, height: r.height + 2 };
         return (
           <div key={it.id} role="button" tabIndex={-1} data-testid={`text-target-${it.id}`}
             title={it.editable ? (it.mixed && it.kind === "block"
@@ -329,7 +378,8 @@ export default function TextEditOverlay({
             className={`absolute rounded-[2px] ${it.editable ? "cursor-text" : "cursor-not-allowed"} ${hot
               ? (it.editable ? "outline outline-2 outline-blue-500 bg-blue-500/10" : "outline outline-1 outline-dashed outline-gray-400")
               : "outline outline-1 outline-dashed outline-blue-300/50"}`}
-            style={{ left: r.left - 1, top: r.top - 1, width: r.width + 2, height: r.height + 2 }} />
+            data-angle={tb ? tb.angle : undefined}
+            style={geom} />
         );
       })}
 
@@ -405,12 +455,54 @@ export default function TextEditOverlay({
             {error && <span className="ml-1 max-w-[16rem] truncate text-red-600 dark:text-red-400" title={error}>{error}</span>}
           </div>
 
-          <textarea ref={textareaRef} aria-label="Edit text" value={draft.text} disabled={saving}
-            spellCheck onKeyDown={onKeyDown}
-            onChange={(e) => setDraft({ ...draft, text: e.target.value })}
-            rows={1}
-            className="block w-full resize-none overflow-hidden rounded-sm bg-white p-[2px] outline outline-2 outline-blue-500 shadow-lg disabled:opacity-70"
-            style={{ ...textStyle, width: Math.max(editorBox.width + 6, 60), minHeight: editorBox.height + 6 }} />
+          {overflow && (() => {
+            const ch = overflowChoices(overflow.info);
+            return (
+              <div role="alertdialog" aria-label="Text does not fit" data-testid="text-overflow-dialog"
+                className={`absolute left-0 z-10 w-max max-w-[22rem] rounded-lg border border-amber-300 bg-amber-50 p-2 text-xs text-gray-800 shadow-lg dark:border-amber-700 dark:bg-gray-800 dark:text-gray-100 ${editorBox.top < 44 ? "top-full mt-10" : "bottom-full mb-10"}`}
+                onMouseDown={(e) => e.preventDefault()}>
+                <div className="mb-1 font-medium">The edited text does not fit here.</div>
+                <div className="mb-2 text-gray-600 dark:text-gray-300">{ch.summary}; there is no room to move the text below down.</div>
+                <div className="flex flex-wrap gap-1">
+                  {ch.shrink && (
+                    <button type="button" onClick={() => resolveOverflow("shrink")}
+                      className="rounded bg-blue-600 px-2 py-1 text-white hover:bg-blue-700">{ch.shrink}</button>
+                  )}
+                  <button type="button" onClick={() => resolveOverflow("allow")}
+                    className="rounded border border-gray-300 bg-white px-2 py-1 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-900 dark:hover:bg-gray-700">{ch.allow}</button>
+                  <button type="button" onClick={() => resolveOverflow(null)}
+                    className="rounded px-2 py-1 hover:bg-gray-100 dark:hover:bg-gray-700">{ch.cancel}</button>
+                </div>
+              </div>
+            );
+          })()}
+
+          {(() => {
+            const ta = (
+              <textarea ref={textareaRef} aria-label="Edit text" value={draft.text} disabled={saving}
+                spellCheck onKeyDown={onKeyDown}
+                onChange={(e) => { setOverflow(null); setDraft({ ...draft, text: e.target.value }); }}
+                rows={1}
+                className="block w-full resize-none overflow-hidden rounded-sm bg-white p-[2px] outline outline-2 outline-blue-500 shadow-lg disabled:opacity-70"
+                style={{
+                  ...textStyle,
+                  width: Math.max((editTilt ? editTilt.w * pxPerPt : editorBox.width) + 6, 60),
+                  minHeight: (editTilt ? editTilt.h * pxPerPt : editorBox.height) + 6,
+                }} />
+            );
+            if (!editTilt) return ta;
+            // rotated text: the editor sits on the text's own box, at its angle
+            const rc = rotBoxToCss(editTilt, pxPerPt, 3);
+            return (
+              <div data-testid="text-edit-rotated" className="absolute"
+                style={{
+                  left: rc.left - (editorBox.left - 3), top: rc.top - (editorBox.top - 3),
+                  transform: rc.transform, transformOrigin: rc.transformOrigin,
+                }}>
+                {ta}
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>

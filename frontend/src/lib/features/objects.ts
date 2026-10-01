@@ -10,7 +10,7 @@
  * CSS zoom transform, so callers never need to know the render DPI or zoom.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, apiFetch } from "../api";
 
 export type Bbox = [number, number, number, number]; // [x0, y0, x1, y1] PDF points
 
@@ -67,7 +67,7 @@ export interface ShapeOptions {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await apiFetch(url, init);
   if (!res.ok) {
     let detail = `Request failed (${res.status})`;
     try {
@@ -306,4 +306,139 @@ export function defaultInsertRect(
   const x0 = (pageWidth - w) / 2;
   const y0 = (pageHeight - h) / 2;
   return [x0, y0, x0 + w, y0 + h];
+}
+
+// ─── Multi-object editing (one backend call = one undo step) ───────────────
+
+export type BatchOpKind = "move" | "delete" | "front" | "back" | "duplicate";
+
+export interface BatchOp {
+  op: BatchOpKind;
+  kind: "image" | "drawing";
+  xref?: number;
+  occurrence?: number;
+  index?: number;
+  bbox: Bbox;
+  new_bbox?: Bbox;
+  dx?: number;
+  dy?: number;
+}
+
+export interface BatchResult {
+  op: BatchOpKind;
+  kind: "image" | "drawing";
+  /** stream = edited in place (stacking order kept); form = inside its Form XObject;
+   *  redact/redraw = legacy re-placement (lands on top); duplicate = new copy on top */
+  method: string;
+  bbox?: Bbox;
+}
+
+/** The identifying part of an object for a batch op. */
+export function objectRef(o: PageObject): Pick<BatchOp, "kind" | "xref" | "occurrence" | "index" | "bbox"> {
+  return o.kind === "image"
+    ? { kind: "image", xref: o.xref, occurrence: o.occurrence, bbox: o.bbox }
+    : { kind: "drawing", index: o.index, bbox: o.bbox };
+}
+
+export function batchObjects(docId: string, page: number, ops: BatchOp[], label?: string) {
+  return postJson<{ status: string; results: BatchResult[] }>(`/api/pdf/${docId}/objects/batch`, {
+    page,
+    ops,
+    ...(label ? { label } : {}),
+  });
+}
+
+export function arrangeObject(docId: string, page: number, o: PageObject, where: "front" | "back") {
+  return postJson<{ status: string; method: string }>(`/api/pdf/${docId}/objects/arrange`, {
+    page,
+    where,
+    ...objectRef(o),
+  });
+}
+
+export type AlignMode = "left" | "center" | "right" | "top" | "middle" | "bottom";
+
+export function unionBbox(boxes: Bbox[]): Bbox {
+  return [
+    Math.min(...boxes.map((b) => b[0])),
+    Math.min(...boxes.map((b) => b[1])),
+    Math.max(...boxes.map((b) => b[2])),
+    Math.max(...boxes.map((b) => b[3])),
+  ];
+}
+
+export function translateBbox(b: Bbox, dx: number, dy: number): Bbox {
+  return [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy];
+}
+
+/** Align boxes to the edge/centre of their common bounding box (sizes unchanged). */
+export function alignBboxes(boxes: Bbox[], mode: AlignMode): Bbox[] {
+  if (boxes.length < 2) return boxes.map((b) => [...b] as Bbox);
+  const u = unionBbox(boxes);
+  return boxes.map((b) => {
+    const w = b[2] - b[0];
+    const h = b[3] - b[1];
+    switch (mode) {
+      case "left":
+        return translateBbox(b, u[0] - b[0], 0);
+      case "right":
+        return translateBbox(b, u[2] - b[2], 0);
+      case "center":
+        return translateBbox(b, (u[0] + u[2]) / 2 - (b[0] + w / 2), 0);
+      case "top":
+        return translateBbox(b, 0, u[1] - b[1]);
+      case "bottom":
+        return translateBbox(b, 0, u[3] - b[3]);
+      case "middle":
+        return translateBbox(b, 0, (u[1] + u[3]) / 2 - (b[1] + h / 2));
+    }
+  });
+}
+
+/**
+ * Distribute boxes so the gaps between neighbours are equal along an axis.
+ * The first and last box (by position) stay put. Needs at least 3 boxes.
+ * Returned in the same order as given.
+ */
+export function distributeBboxes(boxes: Bbox[], axis: "horizontal" | "vertical"): Bbox[] {
+  const out = boxes.map((b) => [...b] as Bbox);
+  if (boxes.length < 3) return out;
+  const lo = axis === "horizontal" ? 0 : 1;
+  const hi = axis === "horizontal" ? 2 : 3;
+  const order = boxes.map((_, i) => i).sort((a, b) => boxes[a][lo] - boxes[b][lo]);
+  const first = boxes[order[0]];
+  const last = boxes[order[order.length - 1]];
+  const total = order.reduce((s, i) => s + (boxes[i][hi] - boxes[i][lo]), 0);
+  const gap = (last[hi] - first[lo] - total) / (order.length - 1);
+  let pos = first[lo];
+  for (const i of order) {
+    const size = boxes[i][hi] - boxes[i][lo];
+    const d = pos - boxes[i][lo];
+    out[i] = axis === "horizontal" ? translateBbox(boxes[i], d, 0) : translateBbox(boxes[i], 0, d);
+    pos += size + gap;
+  }
+  return out;
+}
+
+/** Objects touched by a marquee rectangle (any overlap counts). */
+export function objectsInMarquee<T extends { bbox: Bbox }>(objs: T[], rect: Bbox): T[] {
+  const r = normalizeBbox(rect);
+  return objs.filter((o) => o.bbox[0] <= r[2] && o.bbox[2] >= r[0] && o.bbox[1] <= r[3] && o.bbox[3] >= r[1]);
+}
+
+/** Arrow-key nudge in PDF points: 1pt, or 10pt with Shift. null for other keys. */
+export function nudgeDelta(key: string, shift: boolean): [number, number] | null {
+  const s = shift ? 10 : 1;
+  switch (key) {
+    case "ArrowLeft":
+      return [-s, 0];
+    case "ArrowRight":
+      return [s, 0];
+    case "ArrowUp":
+      return [0, -s];
+    case "ArrowDown":
+      return [0, s];
+    default:
+      return null;
+  }
 }

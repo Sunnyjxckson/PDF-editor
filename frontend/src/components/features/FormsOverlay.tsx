@@ -28,6 +28,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   useFormsStore, createFormField, updateFormField, deleteFormField, fillFormFields,
   rectToPercentStyle, clientToPoints, applyDrag, normalizeRect, defaultRectAt, clampRect,
+  listSelection, toPdfDate,
   type FormField, type Rect, type Handle, type FieldValue,
 } from "@/lib/features/forms";
 
@@ -67,7 +68,7 @@ export default function FormsOverlay({ docId, currentPage, pageWidth, pageHeight
     interRef.current = value;
     setInterState(value);
   };
-  const [editing, setEditing] = useState<{ field: FormField; draft: string } | null>(null);
+  const [editing, setEditing] = useState<{ field: FormField; draft: string; multi?: string[] } | null>(null);
   const [pending, setPending] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const page = { width: pageWidth, height: pageHeight };
@@ -203,7 +204,11 @@ export default function FormsOverlay({ docId, currentPage, pageWidth, pageHeight
     if (f.type === "checkbox") commitFill(f, !f.value ? (f.export_value ?? true) : false);
     else if (f.type === "radio") commitFill(f, f.checked ? null : f.export_value);
     else if (f.type === "text" || f.type === "combo" || f.type === "list")
-      setEditing({ field: f, draft: typeof f.value === "string" ? f.value : "" });
+      setEditing({
+        field: f,
+        draft: typeof f.value === "string" ? f.value : "",
+        multi: f.type === "list" && f.multi_select ? listSelection(f) : undefined,
+      });
   };
 
   if (!pageWidth || !pageHeight) return null;
@@ -291,13 +296,36 @@ export default function FormsOverlay({ docId, currentPage, pageWidth, pageHeight
                 value={editing.draft}
                 maxLength={editing.field.max_len || undefined}
                 onChange={(e) => setEditing({ ...editing, draft: e.target.value })}
-                onBlur={() => { if (editing.draft !== (editing.field.value ?? "")) commitFill(editing.field, editing.draft); setEditing(null); }}
+                placeholder={editing.field.format === "date" ? "mm/dd/yyyy" : undefined}
+                onBlur={() => {
+                  const v = editing.field.format === "date" ? toPdfDate(editing.draft) : editing.draft;
+                  if (v !== (editing.field.value ?? "")) commitFill(editing.field, v);
+                  setEditing(null);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") (e.target as HTMLInputElement).blur();
                   if (e.key === "Escape") setEditing(null);
                 }}
               />
             )
+          ) : editing.multi ? (
+            <select
+              autoFocus
+              multiple
+              aria-label={`Fill ${editing.field.name}`}
+              className="w-full p-1 text-sm border border-blue-500 rounded bg-white dark:bg-gray-900 dark:text-white shadow-lg"
+              size={Math.min(6, Math.max(3, editing.field.options.length))}
+              value={editing.multi}
+              onChange={(e) => setEditing({ ...editing, multi: Array.from(e.target.selectedOptions, (o) => o.value) })}
+              onBlur={() => {
+                const before = listSelection(editing.field);
+                if (editing.multi && editing.multi.join("\u0000") !== before.join("\u0000")) commitFill(editing.field, editing.multi);
+                setEditing(null);
+              }}
+              onKeyDown={(e) => e.key === "Escape" && setEditing(null)}
+            >
+              {editing.field.options.map((o, i) => <option key={o} value={o}>{editing.field.option_labels[i] ?? o}</option>)}
+            </select>
           ) : (
             <select
               autoFocus

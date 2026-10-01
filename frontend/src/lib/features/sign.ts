@@ -9,7 +9,7 @@
  */
 import { create } from "zustand";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, apiFetch } from "../api";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -58,6 +58,11 @@ export interface CertificateInfo {
   not_after: string;
   passphrase_protected: boolean;
   created: string;
+  /** "self_signed" = generated here; "imported" = a .p12/.pfx the user uploaded */
+  source?: "self_signed" | "imported";
+  self_signed?: boolean;
+  issuer?: string | null;
+  chain_length?: number;
 }
 
 export interface SignatureValidation {
@@ -80,12 +85,51 @@ export interface SignatureValidation {
   location?: string | null;
   modified_after_signing: boolean | null;
   summary: string;
+  trust_anchor?: string | null;
+  /** "user" = a certificate trusted in this app; otherwise the system root source */
+  trust_source?: string | null;
+  trust_problem?: "self_signed" | "unknown_issuer" | "revoked" | string | null;
+  revoked?: boolean;
+  revocation_checked?: boolean;
+  timestamped?: boolean;
+  timestamp_time?: string | null;
+  timestamp_valid?: boolean | null;
+  timestamp_trusted?: boolean | null;
+  ltv?: boolean;
 }
 
 export interface ValidationReport {
   signature_count: number;
   signatures: SignatureValidation[];
   empty_signature_fields: { field_name: string; page: number; rect: Rect }[];
+  revocation_checked?: boolean;
+  trust_store?: { system: string; user_certificates: number };
+}
+
+export interface TrustedCertificate {
+  fingerprint_sha256: string;
+  subject: string;
+  issuer: string;
+  self_signed: boolean;
+  is_ca: boolean;
+  not_after: string;
+}
+
+export interface TrustedList {
+  user: TrustedCertificate[];
+  system: { source: string; count: number };
+}
+
+export interface DigitalSignResult {
+  status: string;
+  field_name: string;
+  signer: string;
+  certified: boolean;
+  visible: boolean;
+  timestamped?: boolean;
+  tsa_url?: string | null;
+  ltv?: boolean;
+  self_signed?: boolean;
 }
 
 export interface DigitalSignOptions {
@@ -99,7 +143,18 @@ export interface DigitalSignOptions {
   fieldName?: string;
   showDetails?: boolean;
   lock?: boolean;
+  /** RFC 3161 timestamp from tsaUrl (off by default; needs network) */
+  timestamp?: boolean;
+  tsaUrl?: string;
+  /** Embed OCSP/CRL so the signature validates long-term (CA-issued IDs only) */
+  ltv?: boolean;
 }
+
+export const DEFAULT_TSA_URL = "http://timestamp.digicert.com";
+
+/** One-line honest explanation shown wherever a digital ID is chosen. */
+export const SELF_SIGNED_NOTE =
+  "Self-signed IDs prove the PDF wasn't changed, but Acrobat shows the signer as untrusted; import a CA-issued ID (.p12/.pfx) to fix that.";
 
 // ─── API client ───────────────────────────────────────────────────────────
 
@@ -135,7 +190,7 @@ export function toApiItems(items: PlacedItem[]) {
 }
 
 export async function applySignItems(docId: string, items: PlacedItem[], lock = false): Promise<ApplyResult> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/sign/apply`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/sign/apply`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ items: toApiItems(items), lock }),
@@ -144,7 +199,7 @@ export async function applySignItems(docId: string, items: PlacedItem[], lock = 
 }
 
 export async function stampSignature(docId: string, page: number, rect: Rect, image: string, lock = false): Promise<ApplyResult> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/sign/stamp`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/sign/stamp`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page, rect, image: stripDataUrl(image), lock }),
@@ -153,7 +208,7 @@ export async function stampSignature(docId: string, page: number, rect: Rect, im
 }
 
 export async function lockDocument(docId: string): Promise<{ annotations_flattened: number; fields_flattened: number }> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/sign/lock`, { method: "POST" });
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/sign/lock`, { method: "POST" });
   return asJson(res, "Failed to lock document");
 }
 
@@ -163,7 +218,7 @@ export async function createCertificate(data: {
   organization?: string;
   passphrase?: string;
 }): Promise<CertificateInfo> {
-  const res = await fetch(`${API_BASE}/api/pdf/signing/certificates`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/certificates`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -177,7 +232,7 @@ export async function createCertificate(data: {
 }
 
 export async function getCertificate(certId: string): Promise<CertificateInfo> {
-  const res = await fetch(`${API_BASE}/api/pdf/signing/certificates/${certId}`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/certificates/${certId}`);
   return asJson<CertificateInfo>(res, "Digital ID not found");
 }
 
@@ -186,12 +241,12 @@ export function getCertificateDownloadUrl(certId: string): string {
 }
 
 export async function deleteCertificate(certId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/pdf/signing/certificates/${certId}`, { method: "DELETE" });
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/certificates/${certId}`, { method: "DELETE" });
   await asJson(res, "Failed to delete digital ID");
 }
 
 export async function digitalSign(docId: string, o: DigitalSignOptions) {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/sign/digital`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/sign/digital`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -205,24 +260,165 @@ export async function digitalSign(docId: string, o: DigitalSignOptions) {
       field_name: o.fieldName || null,
       show_details: o.showDetails ?? true,
       lock: !!o.lock,
+      timestamp: !!o.timestamp,
+      tsa_url: o.timestamp ? (o.tsaUrl || "").trim() || null : null,
+      ltv: !!o.ltv,
     }),
   });
-  return asJson<{ status: string; field_name: string; signer: string; certified: boolean; visible: boolean }>(
-    res,
-    "Digital signing failed",
-  );
+  return asJson<DigitalSignResult>(res, "Digital signing failed");
 }
 
-export async function validateDocumentSignatures(docId: string): Promise<ValidationReport> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/sign/validate`);
-  return asJson<ValidationReport>(res, "Validation failed");
-}
-
-export async function validateUploadedPdf(file: File): Promise<ValidationReport> {
+/** Import a CA-issued digital ID. The passphrase is sent once and never stored by the server. */
+export async function importCertificate(file: File, passphrase: string): Promise<CertificateInfo> {
   const fd = new FormData();
   fd.append("file", file);
-  const res = await fetch(`${API_BASE}/api/pdf/signing/validate`, { method: "POST", body: fd });
+  fd.append("passphrase", passphrase);
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/certificates/import`, { method: "POST", body: fd });
+  return asJson<CertificateInfo>(res, "Could not import the digital ID");
+}
+
+export async function listTrustedCertificates(): Promise<TrustedList> {
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/trusted`);
+  return asJson<TrustedList>(res, "Could not load trusted certificates");
+}
+
+export async function addTrustedCertificate(file: File): Promise<{ added: TrustedCertificate[] }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/trusted`, { method: "POST", body: fd });
+  return asJson(res, "Could not trust this certificate");
+}
+
+export async function removeTrustedCertificate(fingerprint: string): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/trusted/${fingerprint}`, { method: "DELETE" });
+  await asJson(res, "Could not remove the trusted certificate");
+}
+
+function revocationQuery(fetchRevocation?: boolean): string {
+  return fetchRevocation ? "?fetch_revocation=true" : "";
+}
+
+export async function validateDocumentSignatures(
+  docId: string,
+  opts: { fetchRevocation?: boolean } = {},
+): Promise<ValidationReport> {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/sign/validate${revocationQuery(opts.fetchRevocation)}`);
   return asJson<ValidationReport>(res, "Validation failed");
+}
+
+export async function validateUploadedPdf(file: File, opts: { fetchRevocation?: boolean } = {}): Promise<ValidationReport> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await apiFetch(`${API_BASE}/api/pdf/signing/validate${revocationQuery(opts.fetchRevocation)}`, {
+    method: "POST",
+    body: fd,
+  });
+  return asJson<ValidationReport>(res, "Validation failed");
+}
+
+// ─── Trust helpers (pure) ─────────────────────────────────────────────────
+
+export function isValidTsaUrl(url: string): boolean {
+  try {
+    const u = new URL(url.trim());
+    return (u.protocol === "http:" || u.protocol === "https:") && !!u.hostname;
+  } catch {
+    return false;
+  }
+}
+
+export function isSelfSignedId(c: Pick<CertificateInfo, "source" | "self_signed"> | null | undefined): boolean {
+  if (!c) return false;
+  return c.self_signed ?? c.source !== "imported";
+}
+
+export type FactTone = "good" | "warn" | "bad" | "neutral";
+export interface SignatureFact {
+  label: string;
+  value: string;
+  tone: FactTone;
+}
+
+/** The five questions people ask about a signature, answered plainly. */
+export function signatureFacts(s: SignatureValidation): SignatureFact[] {
+  const who = [s.signer_name ?? "Unknown signer", s.signer_email ? `<${s.signer_email}>` : ""].filter(Boolean).join(" ");
+  let trusted: SignatureFact;
+  if (s.trusted) {
+    const via = s.trust_source === "user" ? "a certificate you trusted" : "system root";
+    trusted = { label: "Trusted?", value: `Yes, via ${via}${s.trust_anchor ? ` (${s.trust_anchor})` : ""}`, tone: "good" };
+  } else if (s.revoked || s.trust_problem === "revoked") {
+    trusted = { label: "Trusted?", value: "No: the certificate was revoked", tone: "bad" };
+  } else if (s.self_signed || s.trust_problem === "self_signed") {
+    trusted = { label: "Trusted?", value: "No: self-signed ID (Acrobat shows it as untrusted too)", tone: "warn" };
+  } else {
+    trusted = { label: "Trusted?", value: "No: issuer is not in the trust store", tone: "warn" };
+  }
+  const modified: SignatureFact =
+    s.modified_after_signing === null
+      ? { label: "Modified since signing?", value: "Unknown", tone: "neutral" }
+      : !s.intact
+        ? { label: "Modified since signing?", value: "Yes: signed content was altered", tone: "bad" }
+        : s.modified_after_signing
+          ? {
+              label: "Modified since signing?",
+              value: s.summary.startsWith("INVALID") ? "Yes: changes break the signature" : "Yes: later revisions were added",
+              tone: s.summary.startsWith("INVALID") ? "bad" : "warn",
+            }
+          : { label: "Modified since signing?", value: "No", tone: "good" };
+  const ts: SignatureFact = s.timestamped
+    ? {
+        label: "Timestamped?",
+        value: `Yes${s.timestamp_time ? `, ${new Date(s.timestamp_time).toLocaleString()}` : ""}${s.timestamp_trusted ? "" : " (TSA not trusted)"}`,
+        tone: s.timestamp_trusted ? "good" : "warn",
+      }
+    : { label: "Timestamped?", value: "No (time comes from the signer's computer)", tone: "neutral" };
+  const facts: SignatureFact[] = [
+    { label: "Signed by", value: who, tone: "neutral" },
+    { label: "Issuer", value: s.issuer ?? "Unknown", tone: "neutral" },
+    trusted,
+    modified,
+    ts,
+  ];
+  if (s.revocation_checked) {
+    facts.push({ label: "Revocation", value: s.revoked ? "Revoked" : "Checked online: not revoked", tone: s.revoked ? "bad" : "good" });
+  }
+  if (s.ltv) facts.push({ label: "LTV", value: "Validation info embedded", tone: "good" });
+  return facts;
+}
+
+// ─── Sign preferences (localStorage, per viewer) ──────────────────────────
+
+export const SIGN_PREFS_KEY = "pdfeditor.sign.prefs.v1";
+export interface SignPrefs {
+  timestamp: boolean;
+  tsaUrl: string;
+  ltv: boolean;
+  fetchRevocation: boolean;
+}
+export const DEFAULT_SIGN_PREFS: SignPrefs = { timestamp: false, tsaUrl: DEFAULT_TSA_URL, ltv: false, fetchRevocation: false };
+
+export function loadSignPrefs(): SignPrefs {
+  try {
+    const raw = localStorage.getItem(SIGN_PREFS_KEY);
+    if (!raw) return { ...DEFAULT_SIGN_PREFS };
+    const p = JSON.parse(raw) ?? {};
+    return {
+      timestamp: p.timestamp === true,
+      tsaUrl: typeof p.tsaUrl === "string" && p.tsaUrl.trim() ? p.tsaUrl : DEFAULT_TSA_URL,
+      ltv: p.ltv === true,
+      fetchRevocation: p.fetchRevocation === true,
+    };
+  } catch {
+    return { ...DEFAULT_SIGN_PREFS };
+  }
+}
+
+export function saveSignPrefs(p: SignPrefs) {
+  try {
+    localStorage.setItem(SIGN_PREFS_KEY, JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
 }
 
 // ─── Signature library (localStorage) ─────────────────────────────────────

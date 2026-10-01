@@ -1,6 +1,6 @@
 // Typed client for backend/features/convert.py (OCR, export, create, compress).
 // lib/api.ts does not export its base URL, so it is read the same way here.
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, apiFetch } from "../api";
 
 async function errorDetail(res: Response, fallback: string): Promise<string> {
   try {
@@ -60,20 +60,75 @@ export interface OcrJob {
   error?: string;
 }
 
-export async function getOcrLanguages(): Promise<string[]> {
-  const res = await fetch(`${API_BASE}/api/pdf/ocr/languages`);
+export interface OcrLanguageInfo {
+  /** installed tesseract language codes, e.g. ["eng", "spa"] */
+  languages: string[];
+  /** languages that can be downloaded from tesseract-ocr/tessdata_fast */
+  installable: { code: string; name: string }[];
+  /** display names for installed codes */
+  names: Record<string, string>;
+}
+
+export async function getOcrLanguageInfo(): Promise<OcrLanguageInfo> {
+  const res = await apiFetch(`${API_BASE}/api/pdf/ocr/languages`);
   if (!res.ok) throw new Error(await errorDetail(res, "Failed to load OCR languages"));
-  return (await res.json()).languages;
+  const body = await res.json();
+  return {
+    languages: body.languages ?? [],
+    installable: body.installable ?? [],
+    names: body.names ?? {},
+  };
+}
+
+export async function getOcrLanguages(): Promise<string[]> {
+  return (await getOcrLanguageInfo()).languages;
+}
+
+/** Combine languages into tesseract's multi-language form ("eng+spa"), de-duplicated. */
+export function joinOcrLanguages(langs: (string | null | undefined)[]): string {
+  const out: string[] = [];
+  for (const l of langs) if (l && !out.includes(l)) out.push(l);
+  return out.join("+");
+}
+
+export interface InstallLanguageResult {
+  installed: string;
+  already_installed: boolean;
+  bytes?: number;
+  languages: string[];
+}
+
+/** Ask the server to download `{code}.traineddata` (only call from an explicit user click). */
+export async function installOcrLanguage(code: string): Promise<InstallLanguageResult> {
+  const res = await apiFetch(`${API_BASE}/api/pdf/ocr/languages/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  if (!res.ok) throw new Error(await errorDetail(res, `Could not install language ${code}`));
+  return res.json();
+}
+
+export interface ConvertCapabilities {
+  word: boolean;
+  ocr: boolean;
+  languages: string[];
+}
+
+export async function getConvertCapabilities(): Promise<ConvertCapabilities> {
+  const res = await apiFetch(`${API_BASE}/api/pdf/convert/capabilities`);
+  if (!res.ok) throw new Error(await errorDetail(res, "Failed to read converter capabilities"));
+  return res.json();
 }
 
 export async function detectScannedPages(docId: string): Promise<OcrDetectResult> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/ocr/detect`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/ocr/detect`);
   if (!res.ok) throw new Error(await errorDetail(res, "Scan detection failed"));
   return res.json();
 }
 
 export async function startOcr(docId: string, opts: OcrOptions = {}): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/ocr`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/ocr`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(opts),
@@ -83,7 +138,7 @@ export async function startOcr(docId: string, opts: OcrOptions = {}): Promise<st
 }
 
 export async function getOcrJob(jobId: string): Promise<OcrJob> {
-  const res = await fetch(`${API_BASE}/api/pdf/ocr/jobs/${jobId}`);
+  const res = await apiFetch(`${API_BASE}/api/pdf/ocr/jobs/${jobId}`);
   if (!res.ok) throw new Error(await errorDetail(res, "Failed to read OCR progress"));
   return res.json();
 }
@@ -111,14 +166,20 @@ export async function runOcr(
 
 export type ExportFormat = "docx" | "txt" | "md" | "html" | "png" | "jpg" | "xlsx" | "csv";
 
-export function getExportFormatUrl(
-  docId: string,
-  fmt: ExportFormat,
-  opts: { dpi?: number; filename?: string } = {},
-): string {
+export type HtmlLayout = "positioned" | "reflow";
+
+export interface ExportOptions {
+  dpi?: number;
+  filename?: string;
+  /** html only: "positioned" (looks like the PDF) or "reflow" (semantic, reflowable) */
+  layout?: HtmlLayout;
+}
+
+export function getExportFormatUrl(docId: string, fmt: ExportFormat, opts: ExportOptions = {}): string {
   const q = new URLSearchParams();
   if (opts.dpi) q.set("dpi", String(opts.dpi));
   if (opts.filename) q.set("filename", opts.filename);
+  if (fmt === "html" && opts.layout) q.set("layout", opts.layout);
   const qs = q.toString();
   return `${API_BASE}/api/pdf/${docId}/export/${fmt}${qs ? `?${qs}` : ""}`;
 }
@@ -132,9 +193,9 @@ export function filenameFromDisposition(header: string | null, fallback: string)
 export async function exportDocument(
   docId: string,
   fmt: ExportFormat,
-  opts: { dpi?: number; filename?: string } = {},
+  opts: ExportOptions = {},
 ): Promise<{ blob: Blob; filename: string }> {
-  const res = await fetch(getExportFormatUrl(docId, fmt, opts));
+  const res = await apiFetch(getExportFormatUrl(docId, fmt, opts));
   if (!res.ok) throw new Error(await errorDetail(res, `Export to ${fmt.toUpperCase()} failed`));
   const blob = await res.blob();
   const filename = filenameFromDisposition(res.headers.get("Content-Disposition"), `document.${fmt}`);
@@ -167,16 +228,19 @@ export interface CreatedDocument {
 export const CREATE_ACCEPT =
   ".png,.jpg,.jpeg,.gif,.bmp,.tif,.tiff,.webp,.txt,.md,.markdown,.docx,.pdf";
 
+export type DocxEngine = "builtin" | "word";
+
 export async function createPdfFromFiles(
   files: File[],
-  opts: { pageSize?: CreatePageSize; filename?: string } = {},
+  opts: { pageSize?: CreatePageSize; filename?: string; docxEngine?: DocxEngine } = {},
 ): Promise<CreatedDocument> {
   if (!files.length) throw new Error("No files selected");
   const fd = new FormData();
   for (const f of files) fd.append("files", f);
   fd.append("page_size", opts.pageSize ?? "letter");
   if (opts.filename) fd.append("filename", opts.filename);
-  const res = await fetch(`${API_BASE}/api/pdf/create`, { method: "POST", body: fd });
+  if (opts.docxEngine && opts.docxEngine !== "builtin") fd.append("docx_engine", opts.docxEngine);
+  const res = await apiFetch(`${API_BASE}/api/pdf/create`, { method: "POST", body: fd });
   if (!res.ok) throw new Error(await errorDetail(res, "Could not create PDF"));
   return res.json();
 }
@@ -209,7 +273,7 @@ export async function compressDocument(
   const body: Record<string, unknown> = { preset, dry_run: !!opts.dryRun };
   if (opts.targetDpi) body.target_dpi = opts.targetDpi;
   if (opts.quality) body.quality = opts.quality;
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/compress`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/compress`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

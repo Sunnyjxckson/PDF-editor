@@ -12,6 +12,13 @@
  * overlay's own getBoundingClientRect() and the page size in PDF points returned
  * by the backend, so render DPI, pdf.js scale and zoom need not be passed in.
  * The tool bar is portalled to <body> (fixed, bottom-centre) so it is not scaled.
+ *
+ * SELECTION: click selects one object; Shift+click toggles; dragging on empty
+ * page draws a marquee (Shift adds to the selection); Cmd/Ctrl+A selects all.
+ * A multi-selection moves, deletes, duplicates (Cmd/Ctrl+D), aligns,
+ * distributes and arranges as ONE backend batch = one undo step. Arrow keys
+ * nudge by 1pt (Shift: 10pt); nudges are previewed live and committed once,
+ * 400ms after the last key press. Errors are announced via an ARIA live region.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -31,6 +38,17 @@ import {
   X,
   Loader2,
   Check,
+  Copy,
+  BringToFront,
+  SendToBack,
+  AlignStartVertical,
+  AlignCenterVertical,
+  AlignEndVertical,
+  AlignStartHorizontal,
+  AlignCenterHorizontal,
+  AlignEndHorizontal,
+  AlignHorizontalDistributeCenter,
+  AlignVerticalDistributeCenter,
 } from "lucide-react";
 import {
   listObjects,
@@ -54,6 +72,16 @@ import {
   roundBbox,
   hexToRgb01,
   defaultInsertRect,
+  batchObjects,
+  arrangeObject,
+  objectRef,
+  alignBboxes,
+  distributeBboxes,
+  objectsInMarquee,
+  translateBbox,
+  nudgeDelta,
+  type AlignMode,
+  type BatchOp,
   type Bbox,
   type Handle,
   type PageObjects,
@@ -78,6 +106,8 @@ type Tool = "select" | ShapeType;
 
 type DragState =
   | { kind: "object"; mode: "move" | Handle; start: [number, number]; orig: Bbox; obj: PageObject }
+  | { kind: "group"; start: [number, number]; obj: PageObject }
+  | { kind: "marquee"; start: [number, number]; cur: [number, number]; base: string[] }
   | { kind: "shape"; start: [number, number]; cur: [number, number] }
   | { kind: "crop"; start: [number, number]; cur: [number, number] };
 
@@ -101,6 +131,12 @@ function handlePos(h: Handle): { left: string; top: string } {
 
 const area = (b: Bbox) => (b[2] - b[0]) * (b[3] - b[1]);
 
+/** Debounce for committing arrow-key nudges (ms). */
+export const NUDGE_COMMIT_MS = 400;
+const DUPLICATE_OFFSET = 10; // pt
+
+const isEditable = (o: PageObject) => o.kind === "drawing" || o.editable;
+
 export default function ObjectsOverlay({
   docId,
   currentPage,
@@ -114,14 +150,16 @@ export default function ObjectsOverlay({
   const insertInputRef = useRef<HTMLInputElement>(null);
 
   const [data, setData] = useState<PageObjects | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [tool, setTool] = useState<Tool>("select");
   const [drag, setDrag] = useState<DragState | null>(null);
-  const [draft, setDraft] = useState<Bbox | null>(null); // live bbox while moving/resizing
+  const [draft, setDraft] = useState<Bbox | null>(null); // live bbox while moving/resizing ONE object
+  const [groupDelta, setGroupDelta] = useState<[number, number] | null>(null); // live offset for the selection
   const [cropping, setCropping] = useState(false);
   const [cropRect, setCropRect] = useState<Bbox | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState("");
   const [mounted, setMounted] = useState(false);
   const [localVersion, setLocalVersion] = useState(0);
 
@@ -135,7 +173,7 @@ export default function ObjectsOverlay({
   useEffect(() => setMounted(true), []);
 
   // ─── Data ───────────────────────────────────────────────────────────
-  const pendingReselect = useRef<{ kind: PageObject["kind"]; bbox: Bbox } | null>(null);
+  const pendingReselect = useRef<{ kind: PageObject["kind"]; bbox: Bbox }[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -146,9 +184,16 @@ export default function ObjectsOverlay({
         const want = pendingReselect.current;
         pendingReselect.current = null;
         if (want) {
-          const list: PageObject[] = want.kind === "image" ? d.images : d.drawings;
-          const hit = list.find((o) => bboxEquals(o.bbox, want.bbox, 1.5));
-          setSelectedId(hit ? hit.id : null);
+          const ids: string[] = [];
+          for (const w of want) {
+            const list: PageObject[] = w.kind === "image" ? d.images : d.drawings;
+            const hit = list.find((o) => !ids.includes(o.id) && bboxEquals(o.bbox, w.bbox, 1.5));
+            if (hit) ids.push(hit.id);
+          }
+          setSelectedIds(ids);
+        } else {
+          // keep whatever still exists (e.g. after undo/redo elsewhere)
+          setSelectedIds((cur) => cur.filter((id) => [...d.images, ...d.drawings].some((o) => o.id === id)));
         }
       })
       .catch((e: Error) => !cancelled && setError(e.message));
@@ -159,11 +204,12 @@ export default function ObjectsOverlay({
 
   // reset on page change
   useEffect(() => {
-    setSelectedId(null);
+    setSelectedIds([]);
     setCropping(false);
     setCropRect(null);
     setDrag(null);
     setDraft(null);
+    setGroupDelta(null);
   }, [docId, currentPage]);
 
   const objects: PageObject[] = useMemo(() => {
@@ -172,26 +218,29 @@ export default function ObjectsOverlay({
     return [...data.drawings, ...data.images].sort((a, b) => area(b.bbox) - area(a.bbox));
   }, [data]);
 
-  const selected = objects.find((o) => o.id === selectedId) ?? null;
+  const selection = useMemo(() => objects.filter((o) => selectedIds.includes(o.id)), [objects, selectedIds]);
+  const selected = selection.length === 1 ? selection[0] : null;
+  const multi = selection.length > 1;
   const pageW = data?.page_width ?? 1;
   const pageH = data?.page_height ?? 1;
 
   const notify = useCallback(
     (msg: string, type: "success" | "error" | "info") => {
       if (type === "error") setError(msg);
+      else setStatus(msg);
       onNotify?.(msg, type);
     },
     [onNotify],
   );
 
   const run = useCallback(
-    async (label: string, fn: () => Promise<unknown>, reselect?: { kind: PageObject["kind"]; bbox: Bbox }) => {
+    async (label: string, fn: () => Promise<unknown>, reselect?: { kind: PageObject["kind"]; bbox: Bbox }[]) => {
       setBusy(true);
       setError(null);
       try {
         await fn();
         pendingReselect.current = reselect ?? null;
-        if (!reselect) setSelectedId(null);
+        if (!reselect) setSelectedIds([]);
         setLocalVersion((v) => v + 1);
         onDocumentChanged();
         notify(label, "success");
@@ -203,6 +252,29 @@ export default function ObjectsOverlay({
       }
     },
     [notify, onDocumentChanged],
+  );
+
+  /** Move several objects to new boxes: one request (one undo step). */
+  const commitMoves = useCallback(
+    async (moves: { obj: PageObject; bbox: Bbox }[], label?: string) => {
+      const real = moves
+        .map((m) => ({ ...m, bbox: roundBbox(m.bbox) }))
+        .filter((m) => isEditable(m.obj) && !bboxEquals(m.bbox, m.obj.bbox, 0.01));
+      if (!real.length) return;
+      const reselect = moves.map((m) => ({ kind: m.obj.kind, bbox: roundBbox(m.bbox) }));
+      if (real.length === 1) {
+        const { obj, bbox } = real[0];
+        await run(
+          label ?? (obj.kind === "image" ? "Image moved" : "Object moved"),
+          () => (obj.kind === "image" ? moveImage(docId, currentPage, obj, bbox) : moveDrawing(docId, currentPage, obj, bbox)),
+          reselect,
+        );
+      } else {
+        const ops: BatchOp[] = real.map(({ obj, bbox }) => ({ op: "move", ...objectRef(obj), new_bbox: bbox }));
+        await run(label ?? `${real.length} objects moved`, () => batchObjects(docId, currentPage, ops, label), reselect);
+      }
+    },
+    [run, docId, currentPage],
   );
 
   // ─── Pointer helpers ────────────────────────────────────────────────
@@ -219,10 +291,18 @@ export default function ObjectsOverlay({
     if (busy || e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
-    setSelectedId(obj.id);
+    if (mode === "move" && e.shiftKey && !cropping) {
+      // Shift+click toggles membership; no drag
+      setSelectedIds((cur) => (cur.includes(obj.id) ? cur.filter((id) => id !== obj.id) : [...cur, obj.id]));
+      return;
+    }
+    if (mode === "move" && selectedIds.includes(obj.id) && selectedIds.length > 1 && !cropping) {
+      setDrag({ kind: "group", start: toPdf(e.clientX, e.clientY), obj });
+      return;
+    }
+    setSelectedIds([obj.id]);
     if (cropping) return;
-    const editable = obj.kind === "drawing" || obj.editable;
-    if (!editable) return;
+    if (!isEditable(obj)) return;
     setDrag({ kind: "object", mode, start: toPdf(e.clientX, e.clientY), orig: obj.bbox, obj });
     setDraft(obj.bbox);
   };
@@ -241,7 +321,10 @@ export default function ObjectsOverlay({
       setDrag({ kind: "shape", start: p, cur: p });
       return;
     }
-    setSelectedId(null);
+    e.preventDefault();
+    const base = e.shiftKey ? selectedIds : [];
+    setDrag({ kind: "marquee", start: p, cur: p, base });
+    if (!e.shiftKey) setSelectedIds([]);
   };
 
   // window-level move/up so drags continue outside the overlay
@@ -255,6 +338,12 @@ export default function ObjectsOverlay({
         let next = applyDrag(drag.orig, drag.mode, dx, dy, e.shiftKey);
         if (drag.mode === "move") next = clampToPage(next, pageW, pageH);
         setDraft(next);
+      } else if (drag.kind === "group") {
+        setGroupDelta([p[0] - drag.start[0], p[1] - drag.start[1]]);
+      } else if (drag.kind === "marquee") {
+        setDrag({ ...drag, cur: p });
+        const hit = objectsInMarquee(objects, [drag.start[0], drag.start[1], p[0], p[1]]).map((o) => o.id);
+        setSelectedIds([...drag.base, ...hit.filter((id) => !drag.base.includes(id))]);
       } else if (drag.kind === "shape") {
         setDrag({ ...drag, cur: p });
       } else {
@@ -264,7 +353,7 @@ export default function ObjectsOverlay({
         setCropRect(hit ? roundBbox(hit) : null);
       }
     };
-    const onUp = (e: PointerEvent) => {
+    const onUp = async (e: PointerEvent) => {
       const p = toPdf(e.clientX, e.clientY);
       const d = drag;
       setDrag(null);
@@ -274,14 +363,25 @@ export default function ObjectsOverlay({
         let next = applyDrag(d.orig, d.mode, dx, dy, e.shiftKey);
         if (d.mode === "move") next = clampToPage(next, pageW, pageH);
         next = roundBbox(next);
-        setDraft(null);
-        if (bboxEquals(next, d.orig, 0.5)) return; // a click, not a drag
-        const obj = d.obj;
-        if (obj.kind === "image") {
-          run("Image moved", () => moveImage(docId, currentPage, obj, next), { kind: "image", bbox: next });
-        } else {
-          run("Object moved", () => moveDrawing(docId, currentPage, obj, next), { kind: "drawing", bbox: next });
+        if (bboxEquals(next, d.orig, 0.5)) {
+          setDraft(null);
+          return; // a click, not a drag
         }
+        await commitMoves([{ obj: d.obj, bbox: next }]);
+        setDraft(null);
+      } else if (d.kind === "group") {
+        const dx = p[0] - d.start[0];
+        const dy = p[1] - d.start[1];
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+          setGroupDelta(null);
+          setSelectedIds([d.obj.id]); // plain click inside a multi-selection
+          return;
+        }
+        await commitMoves(selection.map((o) => ({ obj: o, bbox: translateBbox(o.bbox, dx, dy) })));
+        setGroupDelta(null);
+      } else if (d.kind === "marquee") {
+        const r = normalizeBbox([d.start[0], d.start[1], p[0], p[1]]);
+        if (r[2] - r[0] < 3 && r[3] - r[1] < 3) setSelectedIds(d.base); // a click on empty page
       } else if (d.kind === "shape") {
         commitShape(d.start, p);
       }
@@ -293,7 +393,7 @@ export default function ObjectsOverlay({
       window.removeEventListener("pointerup", onUp);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drag, toPdf, pageW, pageH, selected, docId, currentPage, run]);
+  }, [drag, toPdf, pageW, pageH, selected, selection, objects, docId, currentPage, commitMoves]);
 
   const shapeOpts = () => ({
     strokeColor: hexToRgb01(strokeHex),
@@ -320,14 +420,56 @@ export default function ObjectsOverlay({
 
   // ─── Actions on selection ───────────────────────────────────────────
   const doDelete = useCallback(() => {
-    if (!selected || busy) return;
-    if (selected.kind === "image") {
-      if (!selected.editable) return;
-      run("Image deleted", () => deleteImage(docId, currentPage, selected));
-    } else {
-      run("Object deleted", () => deleteDrawing(docId, currentPage, selected));
+    if (busy) return;
+    const targets = selection.filter(isEditable);
+    if (!targets.length) return;
+    if (targets.length === 1) {
+      const t = targets[0];
+      if (t.kind === "image") run("Image deleted", () => deleteImage(docId, currentPage, t));
+      else run("Object deleted", () => deleteDrawing(docId, currentPage, t));
+      return;
     }
-  }, [selected, busy, run, docId, currentPage]);
+    const ops: BatchOp[] = targets.map((o) => ({ op: "delete", ...objectRef(o) }));
+    run(`${targets.length} objects deleted`, () => batchObjects(docId, currentPage, ops, `Delete ${targets.length} objects`));
+  }, [selection, busy, run, docId, currentPage]);
+
+  const doDuplicate = useCallback(() => {
+    if (busy) return;
+    const targets = selection.filter(isEditable);
+    if (!targets.length) return;
+    const ops: BatchOp[] = targets.map((o) => ({ op: "duplicate", ...objectRef(o), dx: DUPLICATE_OFFSET, dy: DUPLICATE_OFFSET }));
+    run(
+      targets.length === 1 ? "Duplicated" : `${targets.length} objects duplicated`,
+      () => batchObjects(docId, currentPage, ops, "Duplicate"),
+      targets.map((o) => ({ kind: o.kind, bbox: roundBbox(translateBbox(o.bbox, DUPLICATE_OFFSET, DUPLICATE_OFFSET)) })),
+    );
+  }, [selection, busy, run, docId, currentPage]);
+
+  const doArrange = (where: "front" | "back") => {
+    if (busy) return;
+    const targets = selection.filter(isEditable);
+    if (!targets.length) return;
+    const label = where === "front" ? "Brought to front" : "Sent to back";
+    const reselect = targets.map((o) => ({ kind: o.kind, bbox: o.bbox }));
+    if (targets.length === 1) {
+      run(label, () => arrangeObject(docId, currentPage, targets[0], where), reselect);
+    } else {
+      const ops: BatchOp[] = targets.map((o) => ({ op: where, ...objectRef(o) }));
+      run(label, () => batchObjects(docId, currentPage, ops, label), reselect);
+    }
+  };
+
+  const doAlign = (mode: AlignMode) => {
+    if (selection.length < 2 || busy) return;
+    const next = alignBboxes(selection.map((o) => o.bbox), mode);
+    commitMoves(selection.map((o, i) => ({ obj: o, bbox: next[i] })), `Align ${mode}`);
+  };
+
+  const doDistribute = (axis: "horizontal" | "vertical") => {
+    if (selection.length < 3 || busy) return;
+    const next = distributeBboxes(selection.map((o) => o.bbox), axis);
+    commitMoves(selection.map((o, i) => ({ obj: o, bbox: next[i] })), `Distribute ${axis}ly`);
+  };
 
   const doRotate = () => {
     if (selected?.kind !== "image") return;
@@ -336,10 +478,9 @@ export default function ObjectsOverlay({
     const cy = (b[1] + b[3]) / 2;
     const hw = (b[3] - b[1]) / 2;
     const hh = (b[2] - b[0]) / 2;
-    run("Image rotated", () => rotateImage(docId, currentPage, selected, 90), {
-      kind: "image",
-      bbox: [cx - hw, cy - hh, cx + hw, cy + hh],
-    });
+    run("Image rotated", () => rotateImage(docId, currentPage, selected, 90), [
+      { kind: "image", bbox: [cx - hw, cy - hh, cx + hw, cy + hh] },
+    ]);
   };
 
   const applyCrop = () => {
@@ -348,7 +489,7 @@ export default function ObjectsOverlay({
     const r = cropRect;
     setCropping(false);
     setCropRect(null);
-    run("Image cropped", () => cropImage(docId, currentPage, img, r), { kind: "image", bbox: r });
+    run("Image cropped", () => cropImage(docId, currentPage, img, r), [{ kind: "image", bbox: r }]);
   };
 
   const onReplaceFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -356,10 +497,9 @@ export default function ObjectsOverlay({
     e.target.value = "";
     if (!file || selected?.kind !== "image") return;
     const img = selected;
-    run("Image replaced", () => replaceImage(docId, currentPage, img, file, replaceAll ? "all" : "placement"), {
-      kind: "image",
-      bbox: img.bbox,
-    });
+    run("Image replaced", () => replaceImage(docId, currentPage, img, file, replaceAll ? "all" : "placement"), [
+      { kind: "image", bbox: img.bbox },
+    ]);
   };
 
   const onInsertFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -371,7 +511,7 @@ export default function ObjectsOverlay({
     probe.onload = () => {
       URL.revokeObjectURL(url);
       const rect = defaultInsertRect(probe.naturalWidth || 200, probe.naturalHeight || 200, pageW, pageH);
-      run("Image inserted", () => insertImage(docId, currentPage, rect, file, true), { kind: "image", bbox: rect });
+      run("Image inserted", () => insertImage(docId, currentPage, rect, file, true), [{ kind: "image", bbox: rect }]);
     };
     probe.onerror = () => {
       URL.revokeObjectURL(url);
@@ -380,25 +520,95 @@ export default function ObjectsOverlay({
     probe.src = url;
   };
 
-  // keyboard: Delete removes selection, Escape cancels
+  // ─── Arrow-key nudge: preview live, commit once after a pause ───────
+  const nudgeRef = useRef<{ dx: number; dy: number; targets: PageObject[] } | null>(null);
+  const nudgeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushNudge = useCallback(async () => {
+    if (nudgeTimer.current) clearTimeout(nudgeTimer.current);
+    nudgeTimer.current = null;
+    const n = nudgeRef.current;
+    nudgeRef.current = null;
+    if (!n || (n.dx === 0 && n.dy === 0)) {
+      setGroupDelta(null);
+      return;
+    }
+    await commitMoves(
+      n.targets.map((o) => ({ obj: o, bbox: translateBbox(o.bbox, n.dx, n.dy) })),
+      n.targets.length === 1 ? "Nudged" : `${n.targets.length} objects nudged`,
+    );
+    setGroupDelta(null);
+  }, [commitMoves]);
+
+  // never lose a pending nudge on unmount / page change
+  useEffect(() => () => {
+    if (nudgeTimer.current) clearTimeout(nudgeTimer.current);
+  }, []);
+  useEffect(() => {
+    nudgeRef.current = null;
+    if (nudgeTimer.current) clearTimeout(nudgeTimer.current);
+    nudgeTimer.current = null;
+  }, [docId, currentPage]);
+
+  const nudge = useCallback(
+    (dx: number, dy: number) => {
+      const targets = selection.filter(isEditable);
+      if (!targets.length) return;
+      const cur = nudgeRef.current ?? { dx: 0, dy: 0, targets };
+      cur.dx += dx;
+      cur.dy += dy;
+      nudgeRef.current = cur;
+      setGroupDelta([cur.dx, cur.dy]);
+      if (nudgeTimer.current) clearTimeout(nudgeTimer.current);
+      nudgeTimer.current = setTimeout(() => void flushNudge(), NUDGE_COMMIT_MS);
+    },
+    [selection, flushNudge],
+  );
+
+  // keyboard (capture phase, so page navigation / zoom in Editor never sees
+  // keys we consume): Delete, Escape, arrows, Cmd+D, Cmd+A
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) return;
-      if ((e.key === "Delete" || e.key === "Backspace") && selected && !cropping) {
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (e.target as HTMLElement)?.isContentEditable) return;
+      const mod = e.metaKey || e.ctrlKey;
+      if ((e.key === "Delete" || e.key === "Backspace") && selection.length && !cropping) {
         e.preventDefault();
+        e.stopPropagation();
         doDelete();
+      } else if (mod && !e.altKey && e.key.toLowerCase() === "d" && selection.length && !cropping) {
+        e.preventDefault();
+        e.stopPropagation();
+        doDuplicate();
+      } else if (mod && !e.altKey && e.key.toLowerCase() === "a" && tool === "select" && !cropping) {
+        e.preventDefault();
+        e.stopPropagation();
+        setSelectedIds(objects.filter(isEditable).map((o) => o.id));
+      } else if (!mod && !e.altKey && selection.length && !cropping && tool === "select") {
+        const d = nudgeDelta(e.key, e.shiftKey);
+        if (!d) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (!busy) nudge(d[0], d[1]);
       } else if (e.key === "Escape") {
         if (cropping) {
           setCropping(false);
           setCropRect(null);
         } else if (tool !== "select") setTool("select");
-        else setSelectedId(null);
+        else setSelectedIds([]);
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [selected, cropping, tool, doDelete]);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [selection, objects, cropping, tool, busy, doDelete, doDuplicate, nudge]);
+
+  /** Box to draw for an object right now (live drag / nudge preview). */
+  const liveBbox = (o: PageObject): Bbox => {
+    const isSel = selectedIds.includes(o.id);
+    if (isSel && draft && selected?.id === o.id) return draft;
+    if (isSel && groupDelta && isEditable(o)) return translateBbox(o.bbox, groupDelta[0], groupDelta[1]);
+    return o.bbox;
+  };
 
   // ─── Render ─────────────────────────────────────────────────────────
   const shapePreview =
@@ -407,6 +617,20 @@ export default function ObjectsOverlay({
   const btn =
     "p-2 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-40 disabled:pointer-events-none";
   const btnOn = "p-2 rounded-lg bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400";
+
+  const arrangeButtons = (
+    <>
+      <button title="Duplicate (Ctrl/Cmd+D)" aria-label="Duplicate" className={btn} disabled={busy || cropping} onClick={doDuplicate}>
+        <Copy className="w-4 h-4" />
+      </button>
+      <button title="Bring to front" aria-label="Bring to front" className={btn} disabled={busy || cropping} onClick={() => doArrange("front")}>
+        <BringToFront className="w-4 h-4" />
+      </button>
+      <button title="Send to back" aria-label="Send to back" className={btn} disabled={busy || cropping} onClick={() => doArrange("back")}>
+        <SendToBack className="w-4 h-4" />
+      </button>
+    </>
+  );
 
   const toolbar = (
     <div
@@ -432,7 +656,7 @@ export default function ObjectsOverlay({
             onClick={() => {
               setTool(id);
               setCropping(false);
-              if (id !== "select") setSelectedId(null);
+              if (id !== "select") setSelectedIds([]);
             }}
           >
             <Icon className="w-4 h-4" />
@@ -519,6 +743,7 @@ export default function ObjectsOverlay({
                 <Download className="w-4 h-4" />
               </a>
             )}
+            {(selected.kind === "drawing" || selected.editable) && arrangeButtons}
             {(selected.kind === "drawing" || selected.editable) && (
               <button title="Delete (Del)" aria-label="Delete object" className={`${btn} hover:text-red-600`} disabled={busy || cropping} onClick={doDelete}>
                 <Trash2 className="w-4 h-4" />
@@ -527,12 +752,51 @@ export default function ObjectsOverlay({
           </div>
         )}
 
-        {busy && <Loader2 className="w-4 h-4 animate-spin text-blue-500 mx-1" />}
-        {error && !busy && (
-          <span className="text-xs text-red-600 dark:text-red-400 max-w-[220px] truncate px-1" title={error}>
-            {error}
-          </span>
+        {multi && tool === "select" && (
+          <div className="flex items-center gap-0.5 pl-1 ml-1 border-l border-gray-200 dark:border-gray-700" data-testid="objects-multi-actions">
+            <span className="text-xs text-gray-500 dark:text-gray-400 px-1 whitespace-nowrap">{selection.length} objects</span>
+            {(
+              [
+                ["left", AlignStartVertical, "Align left"],
+                ["center", AlignCenterVertical, "Align centre"],
+                ["right", AlignEndVertical, "Align right"],
+                ["top", AlignStartHorizontal, "Align top"],
+                ["middle", AlignCenterHorizontal, "Align middle"],
+                ["bottom", AlignEndHorizontal, "Align bottom"],
+              ] as const
+            ).map(([mode, Icon, label]) => (
+              <button key={mode} title={label} aria-label={label} className={btn} disabled={busy} onClick={() => doAlign(mode)}>
+                <Icon className="w-4 h-4" />
+              </button>
+            ))}
+            <button title="Distribute horizontally (3+)" aria-label="Distribute horizontally" className={btn} disabled={busy || selection.length < 3} onClick={() => doDistribute("horizontal")}>
+              <AlignHorizontalDistributeCenter className="w-4 h-4" />
+            </button>
+            <button title="Distribute vertically (3+)" aria-label="Distribute vertically" className={btn} disabled={busy || selection.length < 3} onClick={() => doDistribute("vertical")}>
+              <AlignVerticalDistributeCenter className="w-4 h-4" />
+            </button>
+            {arrangeButtons}
+            <button title="Delete selected (Del)" aria-label="Delete selected objects" className={`${btn} hover:text-red-600`} disabled={busy} onClick={doDelete}>
+              <Trash2 className="w-4 h-4" />
+            </button>
+          </div>
         )}
+
+        {busy && <Loader2 className="w-4 h-4 animate-spin text-blue-500 mx-1" aria-hidden="true" />}
+        {/* Live regions: errors are announced assertively, results politely. Always
+            mounted (empty when idle) so screen readers pick up changes. */}
+        <span
+          role="alert"
+          aria-live="assertive"
+          data-testid="objects-error"
+          className={error && !busy ? "text-xs text-red-600 dark:text-red-400 max-w-[220px] truncate px-1" : "sr-only"}
+          title={error ?? undefined}
+        >
+          {error && !busy ? error : ""}
+        </span>
+        <span role="status" aria-live="polite" className="sr-only" data-testid="objects-status">
+          {status}
+        </span>
         {onExit && (
           <button title="Exit objects mode" aria-label="Exit objects mode" className={btn} onClick={onExit}>
             <X className="w-4 h-4" />
@@ -555,8 +819,9 @@ export default function ObjectsOverlay({
       >
         {data &&
           objects.map((obj) => {
-            const isSel = obj.id === selectedId;
-            const b = isSel && draft ? draft : obj.bbox;
+            const isSel = selectedIds.includes(obj.id);
+            const isOnly = isSel && selected?.id === obj.id;
+            const b = liveBbox(obj);
             const isImage = obj.kind === "image";
             const editable = !isImage || obj.editable;
             const bg = obj.kind === "drawing" && obj.background;
@@ -564,6 +829,7 @@ export default function ObjectsOverlay({
               <div
                 key={obj.id}
                 data-testid={`obj-${obj.id}`}
+                aria-selected={isSel}
                 className={`absolute ${
                   isSel
                     ? "outline outline-2 outline-blue-500 bg-blue-500/5"
@@ -582,12 +848,12 @@ export default function ObjectsOverlay({
                 }}
                 title={
                   isImage
-                    ? `Image ${obj.width}×${obj.height}px${obj.method === "redact" ? " (inside a form; edits re-place it on top)" : ""}${!obj.editable ? " (inline image, read-only)" : ""}`
+                    ? `Image ${obj.width}×${obj.height}px${obj.method === "redact" ? " (inside a form)" : ""}${!obj.editable ? " (inline image, read-only)" : ""}`
                     : `Vector object (${obj.path_count} paths)`
                 }
                 onPointerDown={(e) => tool === "select" && startObjectDrag(e, obj, "move")}
               >
-                {isSel && draft && isImage && obj.xref > 0 && (
+                {isSel && (draft || groupDelta) && isImage && obj.xref > 0 && (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
                     src={getImageExtractUrl(docId, obj.xref, "png")}
@@ -596,7 +862,7 @@ export default function ObjectsOverlay({
                     style={{ objectFit: "fill" }}
                   />
                 )}
-                {isSel && editable && !cropping && tool === "select" &&
+                {isOnly && editable && !cropping && tool === "select" &&
                   HANDLES.map((h) => (
                     <div
                       key={h}
@@ -609,6 +875,15 @@ export default function ObjectsOverlay({
               </div>
             );
           })}
+
+        {/* marquee */}
+        {drag?.kind === "marquee" && (
+          <div
+            data-testid="objects-marquee"
+            className="absolute pointer-events-none border border-blue-500 bg-blue-500/10"
+            style={bboxToPercentStyle(normalizeBbox([drag.start[0], drag.start[1], drag.cur[0], drag.cur[1]]), pageW, pageH)}
+          />
+        )}
 
         {/* crop selection */}
         {cropping && selected && (

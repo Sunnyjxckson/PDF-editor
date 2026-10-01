@@ -1,10 +1,15 @@
 """
 Advanced PDF operations: undo/redo, watermark, stamps, images, password protection,
 flatten, page-to-image export, document comparison, and batch operations.
+
+Also the platform helpers every router shares: .env loading, the single
+UPLOAD_DIR, the digital-signature detector used by main.py's signed-document
+guard, and the post-redaction history purge.
 """
 
 import io
 import os
+import sys
 import json
 import math
 import shutil
@@ -12,19 +17,99 @@ import time
 import zipfile
 import base64
 import difflib
+import logging
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import fitz  # PyMuPDF
 from fastapi import APIRouter, HTTPException, Body, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+_log = logging.getLogger("pdf-editor")
+
+# ─── .env loading ─────────────────────────────────────────────────────────────
+#
+# Without this the backend never sees ANTHROPIC_API_KEY when run locally and the
+# chat silently falls back to the regex parser. Loaded here (not only in
+# main.py) because every feature router imports this module first, so values
+# such as UPLOAD_DIR from .env are visible before any module reads them.
+
+_BACKEND_DIR = Path(__file__).resolve().parent
+DEFAULT_ENV_FILES = (_BACKEND_DIR / ".env", _BACKEND_DIR.parent / ".env")
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE parser used only if python-dotenv is unavailable."""
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if key:
+            out[key] = val
+    return out
+
+
+def load_env_files(paths=None) -> list[str]:
+    """Load .env files without overriding variables already set in the process.
+
+    ``paths`` defaults to backend/.env then <repo>/.env (backend-specific wins,
+    because the first file to set a key wins under override=False). Returns the
+    files that were loaded. Never logs or returns any value.
+    """
+    loaded: list[str] = []
+    for p in (DEFAULT_ENV_FILES if paths is None else paths):
+        p = Path(p)
+        if not p.is_file():
+            continue
+        try:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(p, override=False)
+            except ImportError:
+                for k, v in _parse_env_file(p).items():
+                    os.environ.setdefault(k, v)
+            loaded.append(str(p))
+        except Exception as e:  # a malformed .env must not stop the server
+            _log.warning("Could not load env file %s: %s", p, type(e).__name__)
+    if loaded:
+        _log.info("Loaded environment from %s", ", ".join(loaded))
+    return loaded
+
+
+def _should_autoload_env() -> bool:
+    # Under pytest the real .env (with a live API key) must not leak into the
+    # suite: test_chat exercises the no-key fallback and would start making
+    # paid network calls. Opt back in with PDF_EDITOR_LOAD_DOTENV=1.
+    flag = os.environ.get("PDF_EDITOR_LOAD_DOTENV")
+    if flag is not None:
+        return flag == "1"
+    return "pytest" not in sys.modules
+
+
+if _should_autoload_env():
+    load_env_files()
+
 router = APIRouter(prefix="/api/pdf")
 
-# Same rule as main.py so undo history and documents live in one tree.
+# THE upload directory. main.py binds its UPLOAD_DIR to this same object, so
+# undo history and documents always live in one tree (also when UPLOAD_DIR
+# comes from .env, which is loaded just above).
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "uploads"))
+
+
+def upload_dir() -> Path:
+    """Current upload dir (read at call time so test monkeypatching applies)."""
+    return Path(UPLOAD_DIR)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -33,6 +118,160 @@ def get_doc_path(doc_id: str) -> Path:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Document not found")
     return path
+
+
+# ─── Digital-signature detection (used by main.py's signed-document guard) ───
+
+_sig_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+_sig_cache_lock = threading.Lock()
+
+
+def _signer_names(path: Path) -> list[str]:
+    """Best-effort signer common names via pyHanko; [] if unavailable."""
+    try:
+        from pyhanko.pdf_utils.reader import PdfFileReader
+        with open(path, "rb") as fh:
+            reader = PdfFileReader(fh, strict=False)
+            names = []
+            for s in reader.embedded_signatures:
+                name = None
+                try:
+                    cert = s.signer_cert
+                    subj = cert.subject.native if cert is not None else {}
+                    name = subj.get("common_name") or subj.get("organization_name")
+                except Exception:
+                    name = None
+                if not name:
+                    try:
+                        n = s.sig_object.get("/Name")
+                        name = str(n) if n else None
+                    except Exception:
+                        name = None
+                names.append(name or s.field_name or "unknown signer")
+            return names
+    except Exception:
+        return []
+
+
+def _scan_signatures(path: Path) -> dict:
+    """Find signature dictionaries that carry a /ByteRange (i.e. are signed)."""
+    count = 0
+    fitz_names: list[str] = []
+    try:
+        doc = fitz.open(str(path))
+    except Exception:
+        return {"signed": False, "count": 0, "signers": []}
+    try:
+        if doc.needs_pass:
+            # Encrypted docs can't be scanned without the password; the
+            # routers already refuse to edit them (423), so nothing to guard.
+            return {"signed": False, "count": 0, "signers": []}
+        for xref in range(1, doc.xref_length()):
+            try:
+                kind, _ = doc.xref_get_key(xref, "ByteRange")
+            except Exception:
+                continue
+            if kind != "array":
+                continue
+            count += 1
+            try:
+                nk, nv = doc.xref_get_key(xref, "Name")
+                if nk == "string" and nv:
+                    fitz_names.append(nv)
+            except Exception:
+                pass
+    finally:
+        doc.close()
+    signers: list[str] = []
+    if count:
+        signers = _signer_names(path) or fitz_names or ["unknown signer"]
+    return {"signed": count > 0, "count": count, "signers": signers}
+
+
+def signature_info(path: Union[str, Path]) -> dict:
+    """{"signed": bool, "count": int, "signers": [str]} for the PDF at path.
+
+    Cached per file and invalidated whenever its mtime or size changes, so the
+    scan runs once per document version, not once per request.
+    """
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return {"signed": False, "count": 0, "signers": []}
+    key = str(p.resolve())
+    stamp = (st.st_mtime_ns, st.st_size)
+    with _sig_cache_lock:
+        hit = _sig_cache.get(key)
+        if hit and hit[0] == stamp:
+            return dict(hit[1])
+    info = _scan_signatures(p)
+    with _sig_cache_lock:
+        _sig_cache[key] = (stamp, info)
+    return dict(info)
+
+
+def clear_signature_cache() -> None:
+    with _sig_cache_lock:
+        _sig_cache.clear()
+
+
+# ─── Post-redaction purge ─────────────────────────────────────────────────────
+#
+# Applying redactions removes content from original.pdf, but every earlier
+# undo snapshot (and derived caches like analysis.json or the chat history)
+# still holds the unredacted text. After a successful apply we delete all of
+# it: the redaction is deliberately NOT undoable.
+
+DERIVED_CACHE_FILES = ("analysis.json",)
+_purge_hooks: list[Callable[[str], None]] = []
+
+
+def register_purge_hook(fn: Callable[[str], None]) -> None:
+    """Extra in-memory state to drop after redaction (e.g. main's chat history)."""
+    if fn not in _purge_hooks:
+        _purge_hooks.append(fn)
+
+
+def purge_history_after_redaction(doc_id: str, reason: str = "Apply redactions") -> dict:
+    """Delete every undo/redo snapshot and derived text cache for doc_id."""
+    doc_dir = UPLOAD_DIR / doc_id
+    removed = 0
+    hdir = doc_dir / "history"
+    if hdir.exists():
+        for f in hdir.iterdir():
+            try:
+                if f.is_dir():
+                    shutil.rmtree(f)
+                else:
+                    f.unlink()
+                removed += 1
+            except OSError as e:
+                _log.error("Redaction purge could not remove %s: %s", f.name, e)
+    for name in DERIVED_CACHE_FILES:
+        fp = doc_dir / name
+        if fp.exists():
+            fp.unlink()
+            removed += 1
+    # Stray temp files from interrupted saves can hold pre-redaction bytes.
+    for fp in doc_dir.glob("*.tmp"):
+        try:
+            fp.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if doc_dir.exists():
+        _save_history(doc_id, {
+            "versions": [],
+            "current": -1,
+            "purged": {"reason": reason, "timestamp": datetime.now().isoformat()},
+        })
+    for hook in list(_purge_hooks):
+        try:
+            hook(doc_id)
+        except Exception as e:
+            _log.error("Redaction purge hook failed: %s", e)
+    return {"removed_files": removed}
 
 
 # ─── Undo / Redo System ──────────────────────────────────────────────────────
@@ -108,6 +347,12 @@ async def undo(doc_id: str):
     history = _load_history(doc_id)
 
     if history["current"] < 0 or not history["versions"]:
+        if history.get("purged"):
+            raise HTTPException(
+                status_code=400,
+                detail="Nothing to undo: undo history was cleared when redactions were applied "
+                       "(unredacted copies are never kept).",
+            )
         raise HTTPException(status_code=400, detail="Nothing to undo")
 
     # The version at `current` is the snapshot taken *before* the last op.
@@ -209,6 +454,7 @@ async def get_history(doc_id: str):
         "current": history["current"],
         "can_undo": history["current"] >= 0 and len(history["versions"]) > 0,
         "can_redo": history["current"] < len(history["versions"]) - 1,
+        "purged": history.get("purged"),
     }
 
 

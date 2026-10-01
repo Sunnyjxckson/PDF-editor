@@ -23,10 +23,26 @@ one placement - surrounding text, vectors and other images are untouched and
 z-order is preserved.
 
 If an image is drawn from inside a Form XObject (not directly by the page
-stream) we cannot address the placement in the page stream; those operations
-fall back to redaction-based removal (``images=PDF_REDACT_IMAGE_REMOVE``,
-text and line-art untouched) plus re-insertion, and the response reports
-``"method": "redact"``.
+stream), moves/deletes edit the `Do` inside that form instead (same formula; the
+response reports ``"method": "form"``) when the form is used by no other page or
+placement and its BBox clip would not cut the new position off. Otherwise those
+operations fall back to redaction-based removal (``images=PDF_REDACT_IMAGE_REMOVE``,
+text and line-art untouched) plus re-insertion (``"method": "redact"``), which
+puts the image on top.
+
+How vector objects are edited
+-----------------------------
+``_scan_paths`` finds every painted path in the page stream (byte range, CTM,
+geometry); ``_map_paths_to_segments`` aligns them with ``get_drawings()``. A
+move wraps the existing operators as ``q X cm <path> Q`` (graphics-state ops
+found inside the path are re-emitted after the ``Q``), a delete removes them -
+so stacking order is preserved. Every in-place batch is VERIFIED by re-reading
+the page (all image/path boxes must be exactly as expected); on any mismatch it
+is rolled back and the legacy remove + redraw method is used.
+
+``POST /objects/batch`` applies several move/delete/front/back/duplicate ops as
+one change (one undo snapshot); ``POST /objects/arrange`` brings one object to
+the front or sends it to the back.
 """
 
 from __future__ import annotations
@@ -208,6 +224,238 @@ def _find_do_ops(data: bytes) -> list[tuple[int, int, str]]:
         prev = None
         i = j
     return out
+
+
+# ─── Generic lexer + path scanner (in-place, z-order preserving edits) ────────
+
+_NUM_RE = re.compile(rb"^[+-]?(\d+\.?\d*|\.\d+)$")
+_PAINT_OPS = {b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"n"}
+_CONSTRUCT_OPS = {b"m", b"l", b"c", b"v", b"y", b"h", b"re"}
+# graphics-state operators that are legal (or tolerated) between path operators
+_STATE_OPS = {
+    b"w", b"J", b"j", b"M", b"d", b"ri", b"i", b"gs", b"CS", b"cs", b"SC", b"SCN",
+    b"sc", b"scn", b"G", b"g", b"RG", b"rg", b"K", b"k",
+}
+
+
+def _lex(data: bytes) -> list[tuple[str, int, int, bytes]]:
+    """Tokenize a content stream into (kind, start, end, raw) tuples.
+
+    kind: "num" | "name" | "op" | "other" (strings, arrays, dict delimiters) |
+    "inline" (a whole BI ... EI inline image). Same skipping rules as
+    ``_find_do_ops`` so operator look-alikes inside strings never match.
+    """
+    out: list[tuple[str, int, int, bytes]] = []
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        if c in _WS:
+            i += 1
+            continue
+        if c == 0x25:
+            while i < n and data[i] not in b"\r\n":
+                i += 1
+            continue
+        if c == 0x28:
+            s, depth, i = i, 1, i + 1
+            while i < n and depth:
+                ch = data[i]
+                if ch == 0x5C:
+                    i += 2
+                    continue
+                if ch == 0x28:
+                    depth += 1
+                elif ch == 0x29:
+                    depth -= 1
+                i += 1
+            out.append(("other", s, i, b""))
+            continue
+        if c == 0x3C:
+            s = i
+            if i + 1 < n and data[i + 1] == 0x3C:
+                i += 2
+            else:
+                j = data.find(b">", i + 1)
+                i = n if j < 0 else j + 1
+            out.append(("other", s, i, b""))
+            continue
+        if c in b">[]{})":
+            out.append(("other", i, i + 1, b""))
+            i += 1
+            continue
+        if c == 0x2F:
+            j = i + 1
+            while j < n and data[j] not in _WS and data[j] not in _DELIM:
+                j += 1
+            out.append(("name", i, j, data[i:j]))
+            i = j
+            continue
+        j = i
+        while j < n and data[j] not in _WS and data[j] not in _DELIM:
+            j += 1
+        if j == i:  # stray delimiter
+            i += 1
+            continue
+        tok = data[i:j]
+        if tok == b"BI":
+            k = data.find(b"ID", j)
+            if k < 0:
+                out.append(("inline", i, n, b"BI"))
+                break
+            m = re.compile(rb"[\s]EI(?=[\s/\[<(%]|$)").search(data, k + 3)
+            j = n if m is None else m.end()
+            out.append(("inline", i, j, b"BI"))
+        elif _NUM_RE.match(tok):
+            out.append(("num", i, j, tok))
+        else:
+            out.append(("op", i, j, tok))
+        i = j
+    return out
+
+
+def _q_balance(data: bytes) -> int:
+    """Number of `q` left open at the end of a content stream (>= 0)."""
+    depth = 0
+    for kind, _, _, raw in _lex(data):
+        if kind == "op":
+            if raw == b"q":
+                depth += 1
+            elif raw == b"Q" and depth:
+                depth -= 1
+    return depth
+
+
+def _scan_paths(data: bytes) -> list[dict]:
+    """Every painted path in a content stream with its byte range and geometry.
+
+    Each entry: start/end (bytes from the first operand of the first path
+    operator through the painting operator), op (painting operator), ctm (CTM
+    in effect, PDF space), points (path points in PDF default space), clip
+    (W/W* seen), state (raw graphics-state operator snippets found *inside* the
+    path, re-emitted after an in-place wrap so later content keeps them), bad
+    (something we cannot safely wrap, e.g. a `cm` inside the path).
+    """
+    segs: list[dict] = []
+    ctm = fitz.Matrix(1, 0, 0, 1, 0, 0)
+    stack: list[fitz.Matrix] = []
+    operands: list[tuple[str, int, int, bytes]] = []
+    cur: Optional[dict] = None
+
+    def nums(k: int) -> Optional[list[float]]:
+        vals = [float(t[3]) for t in operands[-k:] if t[0] == "num"] if k else []
+        return vals if len(vals) == k and len(operands) >= k else None
+
+    for tok in _lex(data):
+        kind, s, e, raw = tok
+        if kind != "op":
+            if kind == "inline":
+                if cur is not None:
+                    cur["bad"] = True
+                operands = []
+            else:
+                operands.append(tok)
+            continue
+        op_start = operands[0][1] if operands else s
+        if raw in _CONSTRUCT_OPS:
+            if cur is None:
+                cur = {"start": op_start, "ctm": fitz.Matrix(ctm), "points": [], "clip": False,
+                       "state": [], "bad": False}
+            pts: list[tuple[float, float]] = []
+            if raw in (b"m", b"l"):
+                v = nums(2)
+                pts = [(v[0], v[1])] if v else []
+            elif raw == b"c":
+                v = nums(6)
+                pts = [(v[0], v[1]), (v[2], v[3]), (v[4], v[5])] if v else []
+            elif raw in (b"v", b"y"):
+                v = nums(4)
+                pts = [(v[0], v[1]), (v[2], v[3])] if v else []
+            elif raw == b"re":
+                v = nums(4)
+                if v:
+                    x, y, w, h = v
+                    pts = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
+            if raw != b"h" and not pts:
+                cur["bad"] = True
+            cm = cur["ctm"]
+            cur["points"].extend(fitz.Point(px, py) * cm for px, py in pts)
+        elif raw in (b"W", b"W*"):
+            if cur is not None:
+                cur["clip"] = True
+        elif raw in _PAINT_OPS:
+            if cur is not None:
+                cur["end"] = e
+                cur["op"] = raw.decode()
+                segs.append(cur)
+                cur = None
+        elif raw in _STATE_OPS:
+            if cur is not None:
+                cur["state"].append(data[op_start:e])
+        elif raw == b"q":
+            stack.append(fitz.Matrix(ctm))
+            if cur is not None:
+                cur["bad"] = True
+        elif raw == b"Q":
+            if stack:
+                ctm = stack.pop()
+            if cur is not None:
+                cur["bad"] = True
+        elif raw == b"cm":
+            v = nums(6)
+            if v:
+                ctm = fitz.Matrix(*v) * ctm
+            if cur is not None:
+                cur["bad"] = True
+        elif cur is not None:
+            cur["bad"] = True  # text / Do / anything else inside a path: not ours to touch
+        operands = []
+    return segs
+
+
+def _seg_rect(seg: dict, page: fitz.Page) -> Optional[fitz.Rect]:
+    pts = [p * page.transformation_matrix for p in seg["points"]]
+    if not pts:
+        return None
+    return fitz.Rect(min(p.x for p in pts), min(p.y for p in pts), max(p.x for p in pts), max(p.y for p in pts))
+
+
+def _rect_close(a, b, tol: float = 0.75) -> bool:
+    return all(abs(float(x) - float(y)) <= tol for x, y in zip(tuple(a), tuple(b)))
+
+
+def _map_paths_to_segments(page: fitz.Page, data: bytes) -> tuple[list[dict], dict[int, int]]:
+    """Map get_drawings() seqno -> index into _scan_paths(page stream).
+
+    Page-level paths appear in the same order in both lists, so a forward
+    greedy alignment on geometry is exact; paths drawn from inside Form
+    XObjects find no partner and stay unmapped (callers fall back).
+    """
+    segs = _scan_paths(data)
+    cand = [i for i, sg in enumerate(segs) if sg["op"] != "n"]  # `W n` clips are not drawings
+    mapping: dict[int, int] = {}
+    j = 0
+    for p in sorted(page.get_drawings(), key=lambda d: d["seqno"]):
+        for k in range(j, len(cand)):
+            r = _seg_rect(segs[cand[k]], page)
+            if r is not None and _rect_close(r, p["rect"]):
+                mapping[p["seqno"]] = cand[k]
+                j = k + 1
+                break
+    return segs, mapping
+
+
+def _wrap_segment(data: bytes, seg: dict, page: fitz.Page, m: Optional[fitz.Matrix]) -> bytes:
+    """Replacement bytes for a path segment: transformed by m (PyMuPDF space)
+    via a `cm` around the unchanged operators, or deleted when m is None.
+    Graphics-state ops that lived inside the path are re-emitted afterwards."""
+    tail = b"".join(b" " + st for st in seg["state"])
+    if m is None:
+        return tail + b" "
+    p = page.transformation_matrix
+    ctm = seg["ctm"]
+    x = ctm * p * m * ~p * ~ctm
+    body = data[seg["start"] : seg["end"]]
+    return f"q {_mat_str(x)} cm ".encode() + body + b" Q" + tail + b" "
 
 
 def _write_contents(doc: fitz.Document, page: fitz.Page, data: bytes):
@@ -516,7 +764,7 @@ def _remove_paths(page: fitz.Page, bbox: list[float], paths: list[dict]):
     )
 
 
-def _redraw_paths(page: fitz.Page, paths: list[dict], m: fitz.Matrix):
+def _redraw_paths(page: fitz.Page, paths: list[dict], m: fitz.Matrix, overlay: bool = True):
     """Re-create vector paths transformed by m (PyMuPDF space) as real PDF paths."""
     scale = math.sqrt(abs(m.a * m.d - m.b * m.c)) or 1.0
     for p in paths:
@@ -548,7 +796,328 @@ def _redraw_paths(page: fitz.Page, paths: list[dict], m: fitz.Matrix):
             stroke_opacity=p.get("stroke_opacity") if p.get("stroke_opacity") is not None else 1,
             fill_opacity=p.get("fill_opacity") if p.get("fill_opacity") is not None else 1,
         )
-        shape.commit(overlay=True)
+        shape.commit(overlay=overlay)
+
+
+# ─── Batch engine: in-place (z-order preserving) edits with verified fallback ─
+
+
+def _form_image_site(doc: fitz.Document, page: fitz.Page, pl: dict) -> Optional[tuple[int, int, int, str]]:
+    """(form_xref, start, end, name) of the `/Name Do` that draws this placement
+    from inside a Form XObject, when that Do can be edited without affecting any
+    other placement: one referencing form, used by no other page, and its Do
+    count equals the number of placements of the image on this page."""
+    if pl["method"] != "redact" or pl["xref"] <= 0:
+        return None
+    refs: dict[int, set[str]] = {}
+    for item in page.get_images(full=True):
+        if item[0] == pl["xref"]:
+            if item[9] == 0:
+                return None  # also drawn directly by the page: ambiguous
+            refs.setdefault(item[9], set()).add(item[7])
+    if len(refs) != 1:
+        return None
+    fx, names = next(iter(refs.items()))
+    if not doc.xref_is_stream(fx):
+        return None
+    ops = [op for op in _find_do_ops(doc.xref_stream(fx)) if op[2] in names]
+    total = sum(1 for p in _image_placements(page) if p["xref"] == pl["xref"])
+    if len(ops) != total or pl["occurrence"] >= len(ops):
+        return None
+    for pno in range(len(doc)):
+        if pno != page.number and any(x[0] == fx for x in doc[pno].get_xobjects()):
+            return None  # shared with another page: editing it would move that one too
+    s, e, nm = ops[pl["occurrence"]]
+    return fx, s, e, nm
+
+
+def _clip_ok(page: fitz.Page, orig, new) -> bool:
+    """False when a clip that contains the original placement (e.g. the BBox of
+    the Form XObject drawing it) would cut off the new placement."""
+    o, n = fitz.Rect(orig), fitz.Rect(new)
+    for d in page.get_drawings(extended=True):
+        if d.get("type") != "clip" or d.get("scissor") is None:
+            continue
+        sc = fitz.Rect(d["scissor"])
+        grown = fitz.Rect(sc.x0 - 1, sc.y0 - 1, sc.x1 + 1, sc.y1 + 1)
+        if grown.contains(o) and not grown.contains(n):
+            return False
+    return True
+
+
+def _abs_image_cm(pl: dict, page: fitz.Page, t: Optional[fitz.Matrix] = None) -> fitz.Matrix:
+    """CTM (PDF space, from the identity) that draws the image with PyMuPDF transform t."""
+    t = fitz.Matrix(pl["transform"]) if t is None else t
+    return _FLIP * t * ~page.transformation_matrix
+
+
+def _wrap_with(data: bytes, prepend: bytes, append: bytes) -> bytes:
+    if not prepend and not append:
+        return data
+    close = b"Q\n" * (1 + _q_balance(data))
+    return prepend + b"q\n" + data + b"\n" + close + append
+
+
+def _append_content(doc: fitz.Document, page: fitz.Page, snippet: bytes, front: bool = True):
+    data = page.read_contents()
+    if front:
+        _write_contents(doc, page, _wrap_with(data, b"", snippet))
+    else:
+        _write_contents(doc, page, _wrap_with(data, snippet, b""))
+
+
+def _match_rects(expected: list, actual: list, tol: float = 1.0) -> bool:
+    """Multiset equality of (tag, rect) pairs within tol."""
+    if len(expected) != len(actual):
+        return False
+    pool = sorted(actual, key=lambda t: (t[0], t[1][0], t[1][1]))
+    used = [False] * len(pool)
+    for tag, r in sorted(expected, key=lambda t: (t[0], t[1][0], t[1][1])):
+        for k, (tag2, r2) in enumerate(pool):
+            if not used[k] and tag2 == tag and _rect_close(r, r2, tol):
+                used[k] = True
+                break
+        else:
+            return False
+    return True
+
+
+_BATCH_OPS = ("move", "delete", "front", "back", "duplicate")
+
+
+def _resolve_ops(doc: fitz.Document, page: fitz.Page, ops: list) -> list[dict]:
+    if not ops:
+        raise HTTPException(status_code=400, detail="No operations given")
+    if len(ops) > 500:
+        raise HTTPException(status_code=400, detail="Too many operations in one batch")
+    seen: set = set()
+    out = []
+    for o in ops:
+        if o.op not in _BATCH_OPS:
+            raise HTTPException(status_code=400, detail=f"Unknown op '{o.op}'")
+        item: dict = {"op": o.op, "kind": o.kind}
+        if o.kind == "image":
+            if o.xref is None:
+                raise HTTPException(status_code=400, detail="Image ops need xref")
+            item["pl"] = _find_placement(page, o.xref, o.occurrence, o.bbox)
+            key = ("image", o.xref, o.occurrence)
+        elif o.kind == "drawing":
+            if o.index is None:
+                raise HTTPException(status_code=400, detail="Drawing ops need index")
+            item["obj"], item["paths"] = _find_group(page, o.index, o.bbox)
+            key = ("drawing", o.index)
+        else:
+            raise HTTPException(status_code=400, detail="kind must be 'image' or 'drawing'")
+        if key in seen:
+            raise HTTPException(status_code=400, detail="The same object appears twice in one batch")
+        seen.add(key)
+        if o.op == "move":
+            if o.new_bbox is None:
+                raise HTTPException(status_code=400, detail="move needs new_bbox")
+            item["new"] = _from_disp(page, _rect(o.new_bbox))
+        if o.op == "duplicate":
+            v = (fitz.Point(o.dx, o.dy) * page.derotation_matrix) - (fitz.Point(0, 0) * page.derotation_matrix)
+            item["offset"] = fitz.Matrix(1, 0, 0, 1, v.x, v.y)
+        out.append(item)
+    return out
+
+
+def _plan_inplace(doc: fitz.Document, page: fitz.Page, items: list[dict], data: bytes, force_legacy: bool):
+    """Split items into in-place stream edits (z-order preserved) and legacy ops."""
+    do_ops = _find_do_ops(data)
+    segs, seqmap = _map_paths_to_segments(page, data)
+    plan = {"page_edits": [], "prepend": [], "append": [], "form_edits": {}, "img_expect": {},
+            "path_expect": {}, "legacy": [], "post": []}
+    for it in items:
+        op, kind = it["op"], it["kind"]
+        if op == "duplicate":
+            plan["post"].append(it)
+            it["method"] = "duplicate"
+            continue
+        if force_legacy:
+            plan["legacy"].append(it)
+            continue
+        if kind == "image":
+            pl = it["pl"]
+            ikey = (pl["xref"], pl["occurrence"])
+            t_old = fitz.Matrix(pl["transform"])
+            if abs(t_old.a * t_old.d - t_old.b * t_old.c) < 1e-9:
+                plan["legacy"].append(it)
+                continue
+            new_t = t_old * _rect_map(fitz.Rect(pl["bbox"]), it["new"]) if op == "move" else None
+            if pl["method"] == "stream":
+                target = [d for d in do_ops if d[2] in pl["names"]]
+                if pl["occurrence"] >= len(target):
+                    plan["legacy"].append(it)
+                    continue
+                st, en, name = target[pl["occurrence"]]
+                do = f"/{name} Do".encode("latin-1")
+                if op == "move":
+                    m = _FLIP * new_t * ~t_old * _FLIP
+                    plan["page_edits"].append((st, en, f"q {_mat_str(m)} cm ".encode() + do + b" Q"))
+                    plan["img_expect"][ikey] = it["new"]
+                elif op == "delete":
+                    plan["page_edits"].append((st, en, b""))
+                    plan["img_expect"][ikey] = None
+                else:  # front / back: same placement, drawn first or last
+                    plan["page_edits"].append((st, en, b""))
+                    snip = f"q {_mat_str(_abs_image_cm(pl, page))} cm ".encode() + do + b" Q\n"
+                    plan["append" if op == "front" else "prepend"].append(snip)
+                it["method"] = "stream"
+                continue
+            site = _form_image_site(doc, page, pl) if op in ("move", "delete") else None
+            if site and (op == "delete" or _clip_ok(page, pl["bbox"], it["new"])):
+                fx, st, en, name = site
+                do = f"/{name} Do".encode("latin-1")
+                if op == "move":
+                    m = _FLIP * new_t * ~t_old * _FLIP
+                    repl = f"q {_mat_str(m)} cm ".encode() + do + b" Q"
+                    plan["img_expect"][ikey] = it["new"]
+                else:
+                    repl = b""
+                    plan["img_expect"][ikey] = None
+                plan["form_edits"].setdefault(fx, []).append((st, en, repl))
+                it["method"] = "form"
+                continue
+            plan["legacy"].append(it)
+        else:
+            idxs = [seqmap.get(p["seqno"]) for p in it["paths"]]
+            ok = all(i is not None and not segs[i]["bad"] and not segs[i]["clip"] for i in idxs)
+            if not ok:
+                plan["legacy"].append(it)
+                continue
+            m = _rect_map(fitz.Rect(it["obj"]["bbox"]), it["new"]) if op == "move" else None
+            for i in idxs:
+                plan["page_edits"].append((segs[i]["start"], segs[i]["end"], _wrap_segment(data, segs[i], page, m)))
+            for p in it["paths"]:
+                plan["path_expect"][p["seqno"]] = m
+            if op in ("front", "back"):
+                plan["post"].append(it)  # removed in place, redrawn on top / underneath
+            it["method"] = "stream"
+    return plan
+
+
+def _apply_plan(doc: fitz.Document, page: fitz.Page, plan: dict, data: bytes) -> None:
+    edits = sorted(plan["page_edits"], key=lambda t: t[0])
+    for a, b in zip(edits, edits[1:]):
+        if a[1] > b[0]:
+            raise HTTPException(status_code=409, detail="Overlapping edits; refresh and retry")
+    new = data
+    for st, en, repl in reversed(edits):
+        new = new[:st] + repl + new[en:]
+    new = _wrap_with(new, b"".join(plan["prepend"]), b"".join(plan["append"]))
+    if new != data:
+        _write_contents(doc, page, new)
+    for fx, fedits in plan["form_edits"].items():
+        fdata = doc.xref_stream(fx)
+        for st, en, repl in sorted(fedits, key=lambda t: t[0], reverse=True):
+            fdata = fdata[:st] + repl + fdata[en:]
+        doc.update_stream(fx, fdata)
+
+
+def _verify_plan(page: fitz.Page, plan: dict, before_imgs: list[dict], before_paths: list[dict]) -> bool:
+    exp_i, act_i = [], []
+    for pl in before_imgs:
+        key = (pl["xref"], pl["occurrence"])
+        if key in plan["img_expect"]:
+            r = plan["img_expect"][key]
+            if r is not None:
+                exp_i.append((pl["xref"], tuple(r)))
+        else:
+            exp_i.append((pl["xref"], tuple(pl["bbox"])))
+    for pl in _image_placements(page):
+        act_i.append((pl["xref"], tuple(pl["bbox"])))
+    exp_p, act_p = [], []
+    for p in before_paths:
+        if p["seqno"] in plan["path_expect"]:
+            m = plan["path_expect"][p["seqno"]]
+            if m is None:
+                continue
+            exp_p.append((0, tuple(fitz.Rect(p["rect"]) * m)))
+        else:
+            exp_p.append((0, tuple(fitz.Rect(p["rect"]))))
+    for p in page.get_drawings():
+        act_p.append((0, tuple(fitz.Rect(p["rect"]))))
+    return _match_rects(exp_i, act_i) and _match_rects(exp_p, act_p)
+
+
+def _run_legacy(page: fitz.Page, it: dict) -> None:
+    op = it["op"]
+    if it["kind"] == "image":
+        pl = it["pl"]
+        _redact_remove_image(page, pl["bbox"])
+        if op == "move":
+            page.insert_image(it["new"], xref=pl["xref"], keep_proportion=False)
+        elif op in ("front", "back"):
+            page.insert_image(fitz.Rect(pl["bbox"]), xref=pl["xref"], keep_proportion=False, overlay=op == "front")
+        it["method"] = "redact"
+    else:
+        obj, paths = it["obj"], it["paths"]
+        _remove_paths(page, obj["bbox"], paths)
+        if op == "move":
+            _redraw_paths(page, paths, _rect_map(fitz.Rect(obj["bbox"]), it["new"]))
+        elif op in ("front", "back"):
+            _redraw_paths(page, paths, fitz.Identity, overlay=op == "front")
+        it["method"] = "redraw"
+
+
+def _run_post(doc: fitz.Document, page: fitz.Page, it: dict) -> None:
+    op = it["op"]
+    if it["kind"] == "image":
+        pl = it["pl"]
+        t = fitz.Matrix(pl["transform"]) * it["offset"]
+        if pl["method"] == "stream" and pl["names"]:
+            snip = f"q {_mat_str(_abs_image_cm(pl, page, t))} cm /{pl['names'][0]} Do Q\n".encode("latin-1")
+            _append_content(doc, page, snip, front=True)
+        else:
+            page.insert_image(fitz.Rect(pl["bbox"]) * it["offset"], xref=pl["xref"], keep_proportion=False)
+    else:
+        if op == "duplicate":
+            _redraw_paths(page, it["paths"], it["offset"])
+        else:  # front/back after in-place removal
+            _redraw_paths(page, it["paths"], fitz.Identity, overlay=op == "front")
+
+
+def _apply_ops(doc: fitz.Document, page: fitz.Page, ops: list) -> tuple[fitz.Page, list[dict]]:
+    """Apply several object edits to one page as ONE change (callers snapshot once).
+
+    Moves/deletes are done in place in the content stream (the existing `Do` or
+    path operators get a `cm` wrap, or are removed) so stacking order is kept;
+    images drawn from a Form XObject are edited inside that form when it is safe.
+    The result is verified by re-reading the page; if anything else moved, the
+    edit is rolled back and the legacy redaction-based method is used instead.
+    """
+    items = _resolve_ops(doc, page, ops)
+    data = page.read_contents()
+    before_imgs = _image_placements(page)
+    before_paths = page.get_drawings()
+    form_backup: dict[int, bytes] = {}
+    plan = _plan_inplace(doc, page, items, data, force_legacy=False)
+    inplace = bool(plan["page_edits"] or plan["prepend"] or plan["append"] or plan["form_edits"])
+    if inplace:
+        for fx in plan["form_edits"]:
+            form_backup[fx] = doc.xref_stream(fx)
+        contents_key = doc.xref_get_key(page.xref, "Contents")
+        _apply_plan(doc, page, plan, data)
+        page = doc.reload_page(page)
+        if not _verify_plan(page, plan, before_imgs, before_paths):
+            # roll back exactly, then redo everything the legacy way
+            doc.xref_set_key(page.xref, "Contents", contents_key[1])
+            for fx, fdata in form_backup.items():
+                doc.update_stream(fx, fdata)
+            page = doc.reload_page(page)
+            plan = _plan_inplace(doc, page, items, data, force_legacy=True)
+    for it in plan["legacy"]:
+        _run_legacy(page, it)
+    for it in plan["post"]:
+        _run_post(doc, page, it)
+    results = []
+    for it in items:
+        res = {"op": it["op"], "kind": it["kind"], "method": it.get("method", "redact")}
+        if it["op"] == "move":
+            res["bbox"] = _to_disp(page, it["new"])
+        results.append(res)
+    return page, results
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
@@ -581,6 +1150,34 @@ class DrawingRef(BaseModel):
 
 class MoveDrawingRequest(DrawingRef):
     new_bbox: list[float]
+
+
+class BatchOp(BaseModel):
+    op: str  # move | delete | front | back | duplicate
+    kind: str  # image | drawing
+    xref: Optional[int] = None  # images
+    occurrence: int = 0
+    index: Optional[int] = None  # drawings
+    bbox: Optional[list[float]] = None  # client's view; 409 if stale
+    new_bbox: Optional[list[float]] = None  # move
+    dx: float = 0.0  # duplicate offset (displayed page points)
+    dy: float = 0.0
+
+
+class BatchRequest(BaseModel):
+    page: int
+    ops: list[BatchOp]
+    label: Optional[str] = None
+
+
+class ArrangeRequest(BaseModel):
+    page: int
+    kind: str
+    where: str  # front | back
+    xref: Optional[int] = None
+    occurrence: int = 0
+    index: Optional[int] = None
+    bbox: Optional[list[float]] = None
 
 
 class ShapeRequest(BaseModel):
@@ -627,21 +1224,19 @@ async def list_objects(doc_id: str, page_num: int):
 
 @router.post("/{doc_id}/objects/image/move")
 async def move_image(doc_id: str, req: MoveImageRequest):
-    """Move and/or resize one image placement to new_bbox (page coords)."""
+    """Move and/or resize one image placement to new_bbox (page coords).
+
+    The placement keeps its place in the stacking order (also for images drawn
+    from inside a Form XObject, when that form can be edited safely)."""
     doc, path = _open(doc_id)
     page = _page(doc, req.page)
-    pl = _find_placement(page, req.xref, req.occurrence, req.bbox)
-    new = _from_disp(page, _rect(req.new_bbox))
+    op = BatchOp(op="move", kind="image", xref=req.xref, occurrence=req.occurrence, bbox=req.bbox,
+                 new_bbox=req.new_bbox)
+    _resolve_ops(doc, page, [op])  # validate (404/409/400) before snapshotting
     snapshot(doc_id, f"Move image on page {req.page + 1}")
-    if pl["method"] == "stream":
-        r = _rect_map(fitz.Rect(pl["bbox"]), new)
-        _rewrite_placement(doc, page, pl, new_transform=fitz.Matrix(pl["transform"]) * r)
-    else:
-        _redact_remove_image(page, pl["bbox"])
-        page.insert_image(new, xref=pl["xref"], keep_proportion=False)
-    out = _to_disp(page, new)
+    page, results = _apply_ops(doc, page, [op])
     _save(doc, path)
-    return {"status": "ok", "method": pl["method"], "bbox": out}
+    return {"status": "ok", "method": results[0]["method"], "bbox": results[0]["bbox"]}
 
 
 @router.post("/{doc_id}/objects/image/rotate")
@@ -825,19 +1420,17 @@ async def insert_image(
 
 @router.post("/{doc_id}/objects/drawing/move")
 async def move_drawing(doc_id: str, req: MoveDrawingRequest):
-    """Move/resize a grouped vector object. Paths are re-created as real PDF
-    vector paths at the new place (drawn on top) and the originals removed."""
+    """Move/resize a grouped vector object. The existing path operators are
+    transformed in place (stacking order kept); paths that cannot be addressed
+    in the page stream are re-created at the new place and the originals removed."""
     doc, path = _open(doc_id)
     page = _page(doc, req.page)
-    obj, paths = _find_group(page, req.index, req.bbox)
-    new = _from_disp(page, _rect(req.new_bbox))
+    op = BatchOp(op="move", kind="drawing", index=req.index, bbox=req.bbox, new_bbox=req.new_bbox)
+    _resolve_ops(doc, page, [op])
     snapshot(doc_id, f"Move vector object on page {req.page + 1}")
-    m = _rect_map(fitz.Rect(obj["bbox"]), new)
-    _remove_paths(page, obj["bbox"], paths)
-    _redraw_paths(page, paths, m)
-    out = _to_disp(page, new)
+    page, results = _apply_ops(doc, page, [op])
     _save(doc, path)
-    return {"status": "ok", "bbox": out}
+    return {"status": "ok", "bbox": results[0]["bbox"], "method": results[0]["method"]}
 
 
 @router.post("/{doc_id}/objects/drawing/delete")
@@ -845,11 +1438,46 @@ async def delete_drawing(doc_id: str, req: DrawingRef):
     """Delete a grouped vector object; text and images in the area survive."""
     doc, path = _open(doc_id)
     page = _page(doc, req.page)
-    obj, paths = _find_group(page, req.index, req.bbox)
+    op = BatchOp(op="delete", kind="drawing", index=req.index, bbox=req.bbox)
+    _resolve_ops(doc, page, [op])
     snapshot(doc_id, f"Delete vector object on page {req.page + 1}")
-    _remove_paths(page, obj["bbox"], paths)
+    page, results = _apply_ops(doc, page, [op])
     _save(doc, path)
-    return {"status": "ok"}
+    return {"status": "ok", "method": results[0]["method"]}
+
+
+@router.post("/{doc_id}/objects/batch")
+async def batch_objects(doc_id: str, req: BatchRequest):
+    """Apply several move/delete/front/back/duplicate ops on one page as ONE
+    change: a single undo snapshot, one save. Every target is validated against
+    the client's bbox first, so a stale selection changes nothing (409)."""
+    doc, path = _open(doc_id)
+    page = _page(doc, req.page)
+    _resolve_ops(doc, page, req.ops)
+    n = len(req.ops)
+    label = req.label or (f"Edit {n} objects on page {req.page + 1}" if n > 1 else f"Edit object on page {req.page + 1}")
+    snapshot(doc_id, label[:120])
+    page, results = _apply_ops(doc, page, req.ops)
+    if any(r["op"] == "delete" for r in results):
+        _save(doc, path, garbage=1)
+    else:
+        _save(doc, path)
+    return {"status": "ok", "results": results}
+
+
+@router.post("/{doc_id}/objects/arrange")
+async def arrange_object(doc_id: str, req: ArrangeRequest):
+    """Bring an object to the front (drawn last) or send it to the back (drawn first)."""
+    if req.where not in ("front", "back"):
+        raise HTTPException(status_code=400, detail="where must be 'front' or 'back'")
+    doc, path = _open(doc_id)
+    page = _page(doc, req.page)
+    op = BatchOp(op=req.where, kind=req.kind, xref=req.xref, occurrence=req.occurrence, index=req.index, bbox=req.bbox)
+    _resolve_ops(doc, page, [op])
+    snapshot(doc_id, f"{'Bring to front' if req.where == 'front' else 'Send to back'} on page {req.page + 1}")
+    page, results = _apply_ops(doc, page, [op])
+    _save(doc, path)
+    return {"status": "ok", "method": results[0]["method"]}
 
 
 @router.post("/{doc_id}/objects/shape")

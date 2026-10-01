@@ -14,7 +14,7 @@ from typing import Any
 
 import fitz  # PyMuPDF
 
-UPLOAD_DIR = Path("uploads")
+from backend.advanced_ops import UPLOAD_DIR  # single source (env / .env aware); main.py also re-assigns it
 
 
 def _get_doc_path(doc_id: str) -> Path:

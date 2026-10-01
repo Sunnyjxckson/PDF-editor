@@ -5,12 +5,18 @@
 // the backend's _plan_header_footer, so it updates on every keystroke.
 // Margins are entered in points (1/72 in) and drawn proportionally on a
 // miniature of the preview page (page size in PDF points from /info).
+//
+// Each apply creates a removable "run" (Acrobat-style /Artifact /Pagination
+// marked content). The "Existing" strip lists runs already in the document,
+// including headers/footers made by Adobe Acrobat, with Edit and Remove.
 
-import { useMemo, useState } from "react";
-import { Hash, Loader2, PanelTop, Stamp, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Hash, Loader2, PanelTop, Pencil, Stamp, Trash2, X } from "lucide-react";
 import {
-  addBates, addHeaderFooter, addPageNumbers, planHeaderFooter, positionToSlot, parsePageRanges,
-  hexToRgb01, FONT_LABELS, HF_SLOTS, type Base14Font, type HFPosition, type HFSlot, type HeaderFooterOptions,
+  addBates, addHeaderFooter, addPageNumbers, planHeaderFooter, positionToSlot, parsePageRanges, formatPageRanges,
+  hexToRgb01, rgb01ToHex, FONT_LABELS, HF_SLOTS, listHeaderFooterRuns, removeHeaderFooterRun, removeAllHeaderFooterRuns,
+  updateHeaderFooterRun, describeRun,
+  type Base14Font, type HFPosition, type HFRun, type HFSlot, type HeaderFooterOptions,
 } from "@/lib/features/organize";
 
 export interface OrganizeHeaderFooterDialogProps {
@@ -68,6 +74,55 @@ export default function OrganizeHeaderFooterDialog({
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // existing runs
+  const [runs, setRuns] = useState<HFRun[]>([]);
+  const [editingRun, setEditingRun] = useState<HFRun | null>(null);
+
+  const loadRuns = useCallback(async () => {
+    try {
+      const r = await listHeaderFooterRuns(docId);
+      setRuns(Array.isArray(r) ? r : []);
+    } catch {
+      setRuns([]); // listing is best-effort; adding still works
+    }
+  }, [docId]);
+
+  useEffect(() => { if (open) loadRuns(); }, [open, loadRuns]);
+
+  const startEdit = (run: HFRun) => {
+    const s = run.settings;
+    setEditingRun(run);
+    setTab("header");
+    setPreviewIdx(0);
+    setError(null);
+    if (!s) { setSlots({}); return; } // external run: type new text to replace it
+    setSlots(Object.fromEntries(HF_SLOTS.map((k) => [k, s[k] ?? ""])) as Partial<Record<HFSlot, string>>);
+    if (s.font) setFont(s.font as Base14Font);
+    if (s.font_size) setFontSize(s.font_size);
+    if (s.color) setColor(rgb01ToHex(s.color));
+    if (s.margin_top != null) setMt(s.margin_top);
+    if (s.margin_bottom != null) setMb(s.margin_bottom);
+    if (s.margin_left != null) setMl(s.margin_left);
+    if (s.margin_right != null) setMr(s.margin_right);
+    setSkipFirst(!!s.skip_first);
+    setStartNumber(s.start_number ?? 1);
+    setRangeText(s.pages && s.pages.length ? formatPageRanges(s.pages) : "");
+  };
+
+  const removeRun = async (run: HFRun | null) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = run ? await removeHeaderFooterRun(docId, run.id) : await removeAllHeaderFooterRuns(docId);
+      setRuns(r.runs);
+      if (editingRun && (!run || editingRun.id === run.id)) setEditingRun(null);
+      onDocumentChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const pages = useMemo(() => {
     if (!rangeText.trim()) return { value: null as number[] | null, error: null as string | null };
@@ -84,13 +139,13 @@ export default function OrganizeHeaderFooterDialog({
       margin_top: mt, margin_bottom: mb, margin_left: ml, margin_right: mr,
       skip_first: skipFirst, pages: pages.value,
     };
-    if (tab === "header") return { ...base, ...slots, start_number: startNumber };
+    if (tab === "header") return { ...(editingRun?.settings ?? {}), ...base, ...slots, start_number: startNumber };
     if (tab === "numbers") return { ...base, [positionToSlot(numPos)]: format, start_number: startNumber };
     return {
       ...base, [positionToSlot(batesPos)]: "{bates}",
       bates_prefix: prefix, bates_suffix: suffix, bates_digits: digits, bates_start: batesStart,
     };
-  }, [tab, font, fontSize, color, mt, mb, ml, mr, skipFirst, pages.value, slots, startNumber, numPos, format, batesPos, prefix, suffix, digits, batesStart]);
+  }, [tab, font, fontSize, color, mt, mb, ml, mr, skipFirst, pages.value, slots, startNumber, numPos, format, batesPos, prefix, suffix, digits, batesStart, editingRun]);
 
   const plan = useMemo(() => planHeaderFooter(opts, pageCount), [opts, pageCount]);
   const current = plan[Math.min(previewIdx, Math.max(0, plan.length - 1))];
@@ -109,7 +164,10 @@ export default function OrganizeHeaderFooterDialog({
       skip_first: skipFirst, pages: pages.value,
     };
     try {
-      if (tab === "header") await addHeaderFooter(docId, opts);
+      if (editingRun) {
+        // keep settings the header tab does not show (e.g. Bates prefix/digits)
+        await updateHeaderFooterRun(docId, editingRun.id, { ...(editingRun.settings ?? {}), ...opts, kind: editingRun.kind });
+      } else if (tab === "header") await addHeaderFooter(docId, opts);
       else if (tab === "numbers") await addPageNumbers(docId, { ...style, format, position: numPos, start_number: startNumber });
       else await addBates(docId, { ...style, prefix, suffix, digits, start: batesStart, position: batesPos });
       onDocumentChanged();
@@ -132,7 +190,7 @@ export default function OrganizeHeaderFooterDialog({
 
   const tabBtn = (t: Tab, label: string, Icon: typeof Hash) => (
     <button
-      onClick={() => { setTab(t); setPreviewIdx(0); }}
+      onClick={() => { setTab(t); setPreviewIdx(0); if (t !== "header") setEditingRun(null); }}
       className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 ${tab === t
         ? "border-blue-600 text-blue-700 dark:text-blue-300"
         : "border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"}`}
@@ -152,6 +210,37 @@ export default function OrganizeHeaderFooterDialog({
             <X className="w-4 h-4" />
           </button>
         </div>
+
+        {runs.length > 0 && (
+          <div className="mx-4 mt-3 rounded-lg border border-gray-200 dark:border-gray-800 text-xs" data-testid="hf-runs">
+            <div className="flex items-center px-3 py-1.5 border-b border-gray-200 dark:border-gray-800 text-gray-600 dark:text-gray-300">
+              <span className="font-medium">Existing headers, footers &amp; numbering</span>
+              <button disabled={busy} onClick={() => removeRun(null)} className="ml-auto px-2 py-0.5 rounded text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-40">Remove all</button>
+            </div>
+            {runs.map((run) => (
+              <div key={run.id} className={`flex items-center gap-2 px-3 py-1.5 ${editingRun?.id === run.id ? "bg-blue-50 dark:bg-blue-950/40" : ""}`} data-testid={`hf-run-${run.id}`}>
+                <span className="truncate text-gray-800 dark:text-gray-100">{describeRun(run)}</span>
+                <span className="text-gray-400 shrink-0">{run.pages.length} page(s){run.source === "external" ? " · Acrobat/other" : ""}</span>
+                <div className="ml-auto flex gap-1 shrink-0">
+                  <button disabled={busy} onClick={() => startEdit(run)} className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 disabled:opacity-40"
+                    aria-label={run.editable ? `Edit ${describeRun(run)}` : `Replace ${describeRun(run)}`} title={run.editable ? "Edit text / format" : "Replace with new text"}>
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                  <button disabled={busy} onClick={() => removeRun(run)} className="p-1 rounded hover:bg-red-50 dark:hover:bg-red-950/40 text-red-600 disabled:opacity-40"
+                    aria-label={`Remove ${describeRun(run)}`} title="Remove from every page">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {editingRun && (
+          <div className="mx-4 mt-2 flex items-center gap-2 text-xs text-blue-700 dark:text-blue-300">
+            <span>Editing: {describeRun(editingRun)}. Apply replaces it on every page.</span>
+            <button className="underline" onClick={() => setEditingRun(null)}>Cancel edit</button>
+          </div>
+        )}
 
         <div className="grid md:grid-cols-[1fr_auto] gap-5 p-4 text-xs text-gray-700 dark:text-gray-300">
           <div className="space-y-3">
@@ -215,7 +304,7 @@ export default function OrganizeHeaderFooterDialog({
               </label>
               <label className="flex items-center gap-1.5 col-span-2 mt-4"><input type="checkbox" checked={skipFirst} onChange={(e) => setSkipFirst(e.target.checked)} /> Skip first page</label>
             </fieldset>
-            <p className="text-[11px] text-gray-400">Margins are in points (72 pt = 1 inch). Text is written into the page content, like Acrobat&apos;s header/footer; use Undo to remove it.</p>
+            <p className="text-[11px] text-gray-400">Margins are in points (72 pt = 1 inch). Text is written into the page content as Acrobat-style pagination artifacts, so it can be edited or removed later from the list above.</p>
           </div>
 
           {/* live preview */}
@@ -253,7 +342,7 @@ export default function OrganizeHeaderFooterDialog({
           <div className="flex-1" />
           <button onClick={onClose} className="px-3 py-1.5 rounded-lg text-xs text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800">Cancel</button>
           <button onClick={apply} disabled={busy} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 inline-flex items-center gap-1.5">
-            {busy && <Loader2 className="w-3.5 h-3.5 animate-spin" />} Apply to {plan.length} page(s)
+            {busy && <Loader2 className="w-3.5 h-3.5 animate-spin" />} {editingRun ? "Update" : "Apply to"} {plan.length} page(s)
           </button>
         </div>
       </div>

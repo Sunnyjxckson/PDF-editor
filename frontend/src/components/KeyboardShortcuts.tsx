@@ -11,7 +11,9 @@ const shortcuts = [
     { keys: ["Arrow Right"], desc: "Next page" },
     { keys: ["+", "="], desc: "Zoom in" },
     { keys: ["-"], desc: "Zoom out" },
-    { keys: ["0"], desc: "Reset zoom to 100%" },
+    { keys: ["0"], desc: "Actual size (100%)" },
+    { keys: ["Ctrl/Cmd", "0"], desc: "Actual size (100%)" },
+    { keys: ["Ctrl/Cmd", "+ / -"], desc: "Zoom in / out" },
   ]},
   { section: "Tools", items: MODES.filter((m) => m.shortcut).map((m) => ({ keys: [shortcutLabel(m.shortcut!)], desc: m.label })) },
   { section: "Panels", items: [
@@ -23,6 +25,10 @@ const shortcuts = [
     { keys: ["Ctrl/Cmd", "Z"], desc: "Undo (any change, from any tool)" },
     { keys: ["Ctrl/Cmd", "Shift", "Z"], desc: "Redo" },
     { keys: ["Delete"], desc: "Delete the selected object / field / signature" },
+    { keys: ["Shift", "Click"], desc: "Add or remove an object from the selection (drag on empty page to marquee-select)" },
+    { keys: ["Ctrl/Cmd", "A"], desc: "Select all objects on the page" },
+    { keys: ["Ctrl/Cmd", "D"], desc: "Duplicate selected objects" },
+    { keys: ["Arrows"], desc: "Nudge selected objects 1pt (Shift: 10pt)" },
   ]},
   { section: "General", items: [
     { keys: ["?"], desc: "Show keyboard shortcuts" },

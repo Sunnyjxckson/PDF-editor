@@ -23,6 +23,7 @@ import {
 import {
   useFormsStore, fillFormFields, updateFormField, deleteFormField, flattenForm, detectFormFields,
   getFormDataExportUrl, importFormData, formatFromFilename, groupFieldsByName, missingRequired,
+  summarizeDetected, toPdfDate, listSelection,
   type FormField, type FieldValue, type CreatableFieldType, type UpdateFieldInput,
 } from "@/lib/features/forms";
 
@@ -342,8 +343,13 @@ function FieldControl({
             value={draft}
             maxLength={f.max_len || undefined}
             disabled={disabled}
+            placeholder={f.format === "date" ? "mm/dd/yyyy" : undefined}
+            inputMode={f.format === "date" ? "numeric" : undefined}
             onChange={(e) => setDraft(e.target.value)}
-            onBlur={() => draft !== (f.value ?? "") && onCommit(draft)}
+            onBlur={() => {
+              const v = f.format === "date" ? toPdfDate(draft) : draft;
+              if (v !== (f.value ?? "")) onCommit(v);
+            }}
             onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
           />
         ),
@@ -429,6 +435,27 @@ function FieldControl({
         ),
       );
     case "list":
+      if (f.multi_select) {
+        const sel = listSelection(f);
+        return wrap(
+          <>
+            <select
+              aria-label={f.name}
+              multiple
+              size={Math.min(6, Math.max(3, f.options.length))}
+              className={inputCls}
+              value={sel}
+              disabled={disabled}
+              onChange={(e) => onCommit(Array.from(e.target.selectedOptions, (o) => o.value))}
+            >
+              {f.options.map((o, i) => <option key={o} value={o}>{f.option_labels[i] ?? o}</option>)}
+            </select>
+            <p className="text-[10px] text-gray-400 mt-0.5">
+              {sel.length ? `${sel.length} selected` : "None selected"} · Ctrl/⌘-click to pick several
+            </p>
+          </>,
+        );
+      }
       return wrap(
         <select
           aria-label={f.name}
@@ -507,16 +534,16 @@ function PrepareSection({
             <option value="all">All pages</option>
           </select>
         </div>
-        <p className="text-[11px] text-gray-500">Finds blanks (____), empty boxes, signature lines, “Label:” gaps and checkbox squares, and turns them into fields.</p>
+        <p className="text-[11px] text-gray-500">
+          Finds blanks (____), empty boxes, signature lines, “Label:” gaps and checkbox squares, and turns them into fields.
+          Option boxes that share a question become radio groups; “Date”/“DOB” blanks get a date format. Scanned pages are read with OCR.
+        </p>
         <button
           disabled={!!busy}
           onClick={() =>
             run("detect", async () => {
               const r = await detectFormFields(docId, detectScope === "page" ? { pages: [currentPage] } : {});
-              if (r.created.length === 0) return "No new fields found";
-              const t = r.created.filter((c) => c.type === "text").length;
-              const c = r.created.length - t;
-              return `Created ${r.created.length} field${r.created.length === 1 ? "" : "s"} (${t} text, ${c} checkbox)`;
+              return summarizeDetected(r.created);
             })
           }
           className={`${btnCls} w-full justify-center bg-purple-600 text-white hover:bg-purple-700`}
@@ -554,6 +581,8 @@ function FieldProperties({
   const [options, setOptions] = useState(field.options.join("\n"));
   const [exportValue, setExportValue] = useState(field.export_value ?? "");
   const [editable, setEditable] = useState(!!field.editable);
+  const [multiSelect, setMultiSelect] = useState(!!field.multi_select);
+  const [isDate, setIsDate] = useState(field.format === "date");
   const hasText = field.type === "text" || field.type === "combo" || field.type === "list";
 
   const save = () => {
@@ -569,7 +598,9 @@ function FieldProperties({
       const opts = options.split("\n").map((s) => s.trim()).filter(Boolean);
       if (opts.join("\n") !== field.options.join("\n")) patch.options = opts;
       if (field.type === "combo" && editable !== !!field.editable) patch.editable = editable;
+      if (field.type === "list" && multiSelect !== !!field.multi_select) patch.multi_select = multiSelect;
     }
+    if (field.type === "text" && isDate !== (field.format === "date")) patch.format = isDate ? "date" : "";
     if ((field.type === "checkbox" || field.type === "radio") && exportValue.trim() && exportValue.trim() !== field.export_value) {
       patch.export_value = exportValue.trim();
     }
@@ -618,6 +649,12 @@ function FieldProperties({
       )}
       {field.type === "combo" && (
         <label className={row}>Allow custom text <input type="checkbox" checked={editable} onChange={(e) => setEditable(e.target.checked)} /></label>
+      )}
+      {field.type === "list" && (
+        <label className={row}>Allow multiple selections <input type="checkbox" checked={multiSelect} onChange={(e) => setMultiSelect(e.target.checked)} /></label>
+      )}
+      {field.type === "text" && (
+        <label className={row}>Date (mm/dd/yyyy) <input type="checkbox" checked={isDate} onChange={(e) => setIsDate(e.target.checked)} /></label>
       )}
       <label className={row}>Required <input type="checkbox" checked={required} onChange={(e) => setRequired(e.target.checked)} /></label>
       <label className={row}>Read-only <input type="checkbox" checked={readonly} onChange={(e) => setReadonly(e.target.checked)} /></label>

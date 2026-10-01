@@ -10,7 +10,7 @@
 // (see clientToPagePoint). Page indexes are 0-based.
 //
 // lib/api.ts does not export its base URL, so it is read the same way here.
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, apiFetch } from "../api";
 
 async function errorDetail(res: Response, fallback: string): Promise<string> {
   try {
@@ -32,13 +32,13 @@ async function call<T>(method: string, u: string, body: unknown, fallback: strin
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
   }
-  const res = await fetch(u, init);
+  const res = await apiFetch(u, init);
   if (!res.ok) throw new Error(await errorDetail(res, fallback));
   return res.json() as Promise<T>;
 }
 
 async function callBlob(u: string, body: unknown, fallback: string): Promise<Blob> {
-  const res = await fetch(u, {
+  const res = await apiFetch(u, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -54,7 +54,7 @@ export function organizeThumbnailUrl(docId: string, page: number, version = 0): 
 
 /** Existing (non-organize) endpoint: POST /api/pdf/{id}/reorder with the full new order. */
 export async function reorderDocument(docId: string, pageOrder: number[]): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/pdf/${docId}/reorder`, {
+  const res = await apiFetch(`${API_BASE}/api/pdf/${docId}/reorder`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page_order: pageOrder }),
@@ -108,7 +108,7 @@ export async function insertPagesFromFile(docId: string, opts: InsertFileOptions
   if (opts.sourceDocId) fd.append("source_doc_id", opts.sourceDocId);
   if (opts.pageFrom !== undefined) fd.append("page_from", String(opts.pageFrom));
   if (opts.pageTo !== undefined) fd.append("page_to", String(opts.pageTo));
-  const res = await fetch(url(docId, "insert-file"), { method: "POST", body: fd });
+  const res = await apiFetch(url(docId, "insert-file"), { method: "POST", body: fd });
   if (!res.ok) throw new Error(await errorDetail(res, "Insert from file failed"));
   return res.json() as Promise<{ status: string; page_count: number; inserted: number; inserted_at: number }>;
 }
@@ -220,7 +220,7 @@ export interface HeaderFooterOptions extends HFStyle, Partial<Record<HFSlot, str
 export interface HFPlanItem { page: number; n: number; total: number; bates: string; texts: Partial<Record<HFSlot, string>> }
 
 export function addHeaderFooter(docId: string, opts: HeaderFooterOptions) {
-  return call<{ status: string; stamped_count: number; first: HFPlanItem | null }>(
+  return call<{ status: string; run_id: string; stamped_count: number; first: HFPlanItem | null }>(
     "POST", url(docId, "header-footer"), opts, "Header/footer failed");
 }
 
@@ -251,6 +251,55 @@ export interface BatesOptions extends HFStyle {
 export function addBates(docId: string, opts: BatesOptions) {
   return call<{ status: string; stamped_count: number; first_bates: string | null }>(
     "POST", url(docId, "bates"), opts, "Bates numbering failed");
+}
+
+// Every add (header/footer, page numbers, Bates) is a removable "run": its text is
+// written as /Artifact /Pagination marked content, like Acrobat's, so it can be
+// listed, updated or removed later. Headers/footers made by Acrobat (or any tool
+// using the same structure) show up as the single run id "acrobat".
+
+export type HFRunKind = "header-footer" | "page-numbers" | "bates";
+
+export interface HFRun {
+  id: string;
+  source: "pylor" | "external";
+  kind: HFRunKind;
+  pages: number[];
+  subtypes: ("Header" | "Footer")[];
+  created: string | null;
+  /** Full settings the run was made with (null for external runs). */
+  settings: (HeaderFooterOptions & Required<Pick<HFStyle, "font" | "font_size">>) | null;
+  editable: boolean;
+}
+
+export async function listHeaderFooterRuns(docId: string): Promise<HFRun[]> {
+  return (await call<{ runs: HFRun[] }>("GET", url(docId, "header-footer/runs"), undefined, "Failed to load headers/footers")).runs;
+}
+
+/** Replace a run's text/format (old marked content is removed, then re-stamped). */
+export function updateHeaderFooterRun(docId: string, runId: string, opts: HeaderFooterOptions & { kind?: HFRunKind }) {
+  return call<{ status: string; run_id: string; stamped_count: number; runs: HFRun[] }>(
+    "PUT", url(docId, `header-footer/runs/${encodeURIComponent(runId)}`), opts, "Update header/footer failed");
+}
+
+export function removeHeaderFooterRun(docId: string, runId: string) {
+  return call<{ status: string; removed: number; runs: HFRun[] }>(
+    "DELETE", url(docId, `header-footer/runs/${encodeURIComponent(runId)}`), undefined, "Remove header/footer failed");
+}
+
+export function removeAllHeaderFooterRuns(docId: string) {
+  return call<{ status: string; removed: number; runs: HFRun[] }>(
+    "DELETE", url(docId, "header-footer/runs"), undefined, "Remove headers/footers failed");
+}
+
+/** Short human label for a run, e.g. "Bates: ACME000001", "Header: CONFIDENTIAL". */
+export function describeRun(run: HFRun): string {
+  if (!run.settings) return `${run.subtypes.join(" & ")} added by another application`;
+  const s = run.settings;
+  if (run.kind === "bates") return `Bates: ${batesLabel(s.bates_prefix ?? "", s.bates_start ?? 1, 0, s.bates_digits ?? 6, s.bates_suffix ?? "")}`;
+  const texts = HF_SLOTS.map((k) => s[k]).filter(Boolean) as string[];
+  const label = run.kind === "page-numbers" ? "Page numbers" : "Header/footer";
+  return `${label}: ${texts.join(" | ") || "(empty)"}`;
 }
 
 /** Mirror of the backend's token expansion ({n} {total} {bates} {date}). */
@@ -305,8 +354,58 @@ export async function listBookmarks(docId: string): Promise<Bookmark[]> {
   return r.bookmarks;
 }
 
-export async function addBookmark(docId: string, b: { title: string; page: number; level?: number; index?: number }) {
+/** Add a bookmark. With no `parent`/`index` it becomes a TOP-LEVEL bookmark placed
+ * among the top-level ones in page order; with `parent` it becomes a child of
+ * that bookmark, in page order among its children. */
+export async function addBookmark(docId: string, b: { title: string; page: number; parent?: number; index?: number; level?: number }) {
   return (await call<{ bookmarks: Bookmark[] }>("POST", url(docId, "bookmarks"), b, "Add bookmark failed")).bookmarks;
+}
+
+export type BookmarkDropPosition = "before" | "after" | "inside";
+
+/** Drag-reorder / nest: move a bookmark (with its children) relative to `target`. */
+export async function moveBookmark(docId: string, index: number, target: number, position: BookmarkDropPosition) {
+  return (await call<{ bookmarks: Bookmark[] }>("POST", url(docId, `bookmarks/${index}/move`), { target, position }, "Move bookmark failed")).bookmarks;
+}
+
+/** Nest under the previous sibling (children come along). */
+export async function indentBookmark(docId: string, index: number) {
+  return (await call<{ bookmarks: Bookmark[] }>("POST", url(docId, `bookmarks/${index}/indent`), undefined, "Indent bookmark failed")).bookmarks;
+}
+
+/** Un-nest: becomes the next sibling of its parent (children come along). */
+export async function outdentBookmark(docId: string, index: number) {
+  return (await call<{ bookmarks: Bookmark[] }>("POST", url(docId, `bookmarks/${index}/outdent`), undefined, "Outdent bookmark failed")).bookmarks;
+}
+
+/** Flat index just past bookmark i's subtree. */
+export function bookmarkSubtreeEnd(items: Bookmark[], i: number): number {
+  let j = i + 1;
+  while (j < items.length && items[j].level > items[i].level) j++;
+  return j;
+}
+
+/** Drop zone from the pointer's offset inside a row: top quarter = before,
+ * bottom quarter = after, middle = nest inside. */
+export function bookmarkDropPosition(offsetY: number, rowHeight: number): BookmarkDropPosition {
+  if (rowHeight <= 0) return "before";
+  const f = offsetY / rowHeight;
+  return f < 0.25 ? "before" : f > 0.75 ? "after" : "inside";
+}
+
+/** A bookmark cannot be dropped on itself or on one of its own descendants. */
+export function canDropBookmark(items: Bookmark[], src: number, target: number): boolean {
+  if (src < 0 || target < 0 || src >= items.length || target >= items.length) return false;
+  return target < src || target >= bookmarkSubtreeEnd(items, src);
+}
+
+/** True if the bookmark has a previous sibling to nest under. */
+export function canIndentBookmark(items: Bookmark[], i: number): boolean {
+  for (let j = i - 1; j >= 0; j--) {
+    if (items[j].level === items[i].level) return true;
+    if (items[j].level < items[i].level) return false;
+  }
+  return false;
 }
 
 export async function updateBookmark(docId: string, index: number, patch: { title?: string; page?: number; level?: number }) {
@@ -339,6 +438,8 @@ export interface CommentReply {
   contents: string;
   created: string | null;
   modified: string | null;
+  /** id of the comment this one answers (/IRT); replies to replies chain */
+  in_reply_to?: number | null;
 }
 
 export interface PdfComment extends CommentReply {
@@ -404,6 +505,25 @@ export function deleteComment(docId: string, id: number) {
 
 export async function listStamps(docId: string): Promise<string[]> {
   return (await call<{ stamps: string[] }>("GET", url(docId, "stamps"), undefined, "Failed to load stamps")).stamps;
+}
+
+/** Nesting depth of each reply inside a thread (1 = answers the root). */
+export function replyDepths(root: { id: number; replies: CommentReply[] }): Record<number, number> {
+  const parent: Record<number, number | null | undefined> = {};
+  for (const r of root.replies) parent[r.id] = r.in_reply_to;
+  const out: Record<number, number> = {};
+  for (const r of root.replies) {
+    let d = 1;
+    let p = parent[r.id];
+    const seen = new Set<number>();
+    while (p != null && p !== root.id && p in parent && !seen.has(p)) {
+      seen.add(p);
+      d++;
+      p = parent[p];
+    }
+    out[r.id] = Math.min(d, 4);
+  }
+  return out;
 }
 
 // ─── Pure helpers (unit-tested) ──────────────────────────────────────────────

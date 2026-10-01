@@ -3,28 +3,41 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   X, PenLine, Plus, Trash2, Type, CalendarDays, Check, XIcon, Lock, ShieldCheck, ShieldAlert,
-  ShieldQuestion, KeyRound, Download, Loader2, FileSearch, Upload, Signature,
+  ShieldQuestion, KeyRound, Download, Loader2, FileSearch, Upload, Signature, Clock, BadgeCheck,
 } from "lucide-react";
 import SignCreateDialog from "./SignCreateDialog";
 import {
   addToLibrary,
+  addTrustedCertificate,
   applySignItems,
   createCertificate,
   deleteCertificate,
   digitalSign,
   getCertificate,
   getCertificateDownloadUrl,
+  importCertificate,
+  isSelfSignedId,
+  isValidTsaUrl,
+  listTrustedCertificates,
   loadCertId,
   loadLibrary,
+  loadSignPrefs,
+  removeTrustedCertificate,
   saveCertId,
   saveLibrary,
+  saveSignPrefs,
+  signatureFacts,
+  SELF_SIGNED_NOTE,
+  DEFAULT_SIGN_PREFS,
   useSignStore,
   validateDocumentSignatures,
   validateUploadedPdf,
   type CertificateInfo,
   type SignatureEntry,
   type SignatureKind,
+  type SignPrefs,
   type SignTool,
+  type TrustedList,
   type ValidationReport,
 } from "@/lib/features/sign";
 
@@ -66,6 +79,18 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
   const [appearanceId, setAppearanceId] = useState<string>("auto");
   const [report, setReport] = useState<ValidationReport | null>(null);
   const [uploadReport, setUploadReport] = useState<{ name: string; report: ValidationReport } | null>(null);
+  const [idMode, setIdMode] = useState<"import" | "create">("import");
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importPass, setImportPass] = useState("");
+  const [prefs, setPrefsState] = useState<SignPrefs>(DEFAULT_SIGN_PREFS);
+  const [trusted, setTrusted] = useState<TrustedList | null>(null);
+  const setPrefs = (patch: Partial<SignPrefs>) =>
+    setPrefsState((p) => {
+      const next = { ...p, ...patch };
+      saveSignPrefs(next);
+      return next;
+    });
+  const selfSigned = isSelfSignedId(cert);
 
   const notify = (text: string, type: "success" | "error" | "info" = "info") => {
     setMessage({ text, type });
@@ -75,6 +100,7 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
   useEffect(() => {
     setActive(true);
     setLibrary(loadLibrary());
+    setPrefsState(loadSignPrefs());
     const id = loadCertId();
     if (id) {
       getCertificate(id).then(setCert).catch(() => saveCertId(null));
@@ -83,10 +109,13 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
   }, [setActive, setLibrary]);
 
   // Refresh the signature report when entering the digital/verify tabs
+  // (online OCSP/CRL checks only on the Verify tab, and only when switched on)
   useEffect(() => {
     if (tab === "fill") return;
-    validateDocumentSignatures(docId).then(setReport).catch(() => setReport(null));
-  }, [tab, docId]);
+    const fetchRevocation = tab === "verify" && prefs.fetchRevocation;
+    validateDocumentSignatures(docId, { fetchRevocation }).then(setReport).catch(() => setReport(null));
+    if (tab === "verify") listTrustedCertificates().then(setTrusted).catch(() => setTrusted(null));
+  }, [tab, docId, prefs.fetchRevocation]);
 
   const sigs = library.filter((l) => l.kind === "signature");
   const inits = library.filter((l) => l.kind === "initials");
@@ -157,6 +186,54 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
     }
   };
 
+  const importId = async () => {
+    if (!importFile || !importPass) {
+      notify("Choose your .p12/.pfx file and enter its passphrase", "error");
+      return;
+    }
+    setBusy("cert");
+    try {
+      const c = await importCertificate(importFile, importPass);
+      setCert(c);
+      saveCertId(c.cert_id);
+      setImportFile(null);
+      setImportPass("");
+      notify(`Imported digital ID for ${c.name}${c.self_signed ? " (self-signed)" : ` issued by ${c.issuer}`}`, "success");
+    } catch (e) {
+      notify((e as Error).message, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const forgetId = () => {
+    saveCertId(null);
+    setCert(null);
+    setPassphrase("");
+  };
+
+  const trustFile = async (f: File | undefined) => {
+    if (!f) return;
+    try {
+      const r = await addTrustedCertificate(f);
+      notify(`Trusted ${r.added.map((a) => a.subject).join(", ")}`, "success");
+      setTrusted(await listTrustedCertificates());
+      setReport(await validateDocumentSignatures(docId, { fetchRevocation: prefs.fetchRevocation }));
+    } catch (e) {
+      notify((e as Error).message, "error");
+    }
+  };
+
+  const untrust = async (fp: string) => {
+    try {
+      await removeTrustedCertificate(fp);
+      setTrusted(await listTrustedCertificates());
+      setReport(await validateDocumentSignatures(docId, { fetchRevocation: prefs.fetchRevocation }));
+    } catch (e) {
+      notify((e as Error).message, "error");
+    }
+  };
+
   const removeId = async () => {
     if (!cert || !confirm("Delete this digital ID? Documents you already signed stay signed.")) return;
     try {
@@ -174,6 +251,10 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
     const appearance =
       appearanceId === "none" ? undefined : appearanceId === "auto" ? imageItems[0] : imageItems.find((i) => i.id === appearanceId);
     const others = items.filter((i) => i.id !== appearance?.id && !((i.type === "text" || i.type === "date") && !(i.text ?? "").trim()));
+    if (prefs.timestamp && !isValidTsaUrl(prefs.tsaUrl)) {
+      notify("Enter a valid http(s) timestamp server URL", "error");
+      return;
+    }
     if (docSigned && others.length) {
       notify("This PDF is already signed; extra fill-in items would break that signature. Remove them first.", "error");
       return;
@@ -191,12 +272,18 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
         location,
         fieldName,
         lock: certify,
+        timestamp: prefs.timestamp,
+        tsaUrl: prefs.tsaUrl,
+        ltv: prefs.ltv && !selfSigned,
       });
       clearItems();
       setTool(null);
       onDocumentChanged();
       setReport(await validateDocumentSignatures(docId));
-      notify(`Digitally signed as ${res.signer}${res.certified ? " (certified, no changes allowed)" : ""}`, "success");
+      const extras = [res.certified && "certified, no changes allowed", res.timestamped && "timestamped", res.ltv && "LTV-enabled"]
+        .filter(Boolean)
+        .join(", ");
+      notify(`Digitally signed as ${res.signer}${extras ? ` (${extras})` : ""}`, "success");
     } catch (e) {
       notify((e as Error).message, "error");
     } finally {
@@ -208,7 +295,7 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
     if (!f) return;
     setBusy("verify");
     try {
-      setUploadReport({ name: f.name, report: await validateUploadedPdf(f) });
+      setUploadReport({ name: f.name, report: await validateUploadedPdf(f, { fetchRevocation: prefs.fetchRevocation }) });
     } catch (e) {
       notify((e as Error).message, "error");
     } finally {
@@ -401,9 +488,66 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
             {!cert ? (
               <div className="space-y-2">
                 <p className="text-xs text-gray-600 dark:text-gray-400">
-                  A digital ID cryptographically seals the PDF: any later change is detectable. This creates a
-                  self-signed ID stored on this server (not a CA-issued certificate).
+                  A digital ID cryptographically seals the PDF: any later change is detectable.
                 </p>
+                <p className="text-[11px] rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300 px-2 py-1.5">
+                  {SELF_SIGNED_NOTE}
+                </p>
+                <div className="flex gap-1 text-xs" role="tablist">
+                  {([
+                    ["import", "Import CA-issued ID"],
+                    ["create", "Create self-signed ID"],
+                  ] as const).map(([m, label]) => (
+                    <button
+                      key={m}
+                      role="tab"
+                      aria-selected={idMode === m}
+                      onClick={() => setIdMode(m)}
+                      className={`flex-1 py-1 rounded-lg border ${
+                        idMode === m
+                          ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300"
+                          : "border-gray-300 dark:border-gray-600"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {idMode === "import" ? (
+                  <>
+                    <p className="text-[11px] text-gray-500">
+                      Use the .p12/.pfx from a certificate authority (ideally on Adobe&apos;s AATL list). Its key is kept
+                      encrypted with your passphrase; the passphrase is never saved, so you type it each time you sign.
+                    </p>
+                    <label className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg border border-dashed border-gray-300 dark:border-gray-600 text-xs cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800">
+                      <Upload className="w-4 h-4 shrink-0" />
+                      <span className="truncate">{importFile ? importFile.name : "Choose .p12 / .pfx file…"}</span>
+                      <input
+                        type="file"
+                        accept=".p12,.pfx,application/x-pkcs12"
+                        className="hidden"
+                        onChange={(e) => setImportFile(e.target.files?.[0] ?? null)}
+                      />
+                    </label>
+                    <input
+                      type="password"
+                      value={importPass}
+                      onChange={(e) => setImportPass(e.target.value)}
+                      placeholder="Digital ID passphrase"
+                      autoComplete="current-password"
+                      className="w-full px-2 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-sm"
+                    />
+                    <button
+                      onClick={importId}
+                      disabled={!!busy || !importFile || !importPass}
+                      className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      {busy === "cert" ? <Loader2 className="w-4 h-4 animate-spin" /> : <BadgeCheck className="w-4 h-4" />}
+                      Import digital ID
+                    </button>
+                  </>
+                ) : (
+                  <>
                 {(["name", "email", "organization"] as const).map((k) => (
                   <input
                     key={k}
@@ -427,8 +571,10 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
                   className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
                 >
                   {busy === "cert" ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
-                  Create digital ID
+                  Create self-signed ID
                 </button>
+                  </>
+                )}
               </div>
             ) : (
               <div className="space-y-3">
@@ -436,12 +582,17 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
                   <div className="font-semibold text-sm flex items-center gap-1"><KeyRound className="w-3.5 h-3.5" /> {cert.name}</div>
                   {cert.email && <div className="text-gray-500">{cert.email}</div>}
                   {cert.organization && <div className="text-gray-500">{cert.organization}</div>}
+                  <div className={selfSigned ? "text-amber-700 dark:text-amber-400" : "text-green-700 dark:text-green-400"}>
+                    {selfSigned ? "Self-signed ID" : `CA-issued by ${cert.issuer ?? "unknown issuer"}`}
+                  </div>
+                  {selfSigned && <div className="text-[11px] text-gray-500">{SELF_SIGNED_NOTE}</div>}
                   <div className="text-gray-500">Valid until {new Date(cert.not_after).toLocaleDateString()}</div>
                   <div className="text-gray-400 font-mono truncate" title={cert.fingerprint_sha256}>SHA-256 {cert.fingerprint_sha256.slice(0, 23)}…</div>
                   <div className="flex gap-3 pt-1">
                     <a href={getCertificateDownloadUrl(cert.cert_id)} className="flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline">
                       <Download className="w-3 h-3" /> Public cert
                     </a>
+                    <button onClick={forgetId} className="text-gray-600 dark:text-gray-300 hover:underline">Use another ID</button>
                     <button onClick={removeId} className="text-red-600 hover:underline">Delete ID</button>
                   </div>
                 </div>
@@ -473,6 +624,41 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
                     <span>
                       <span className="font-medium">Certify &amp; lock</span>{" "}
                       <span className="text-gray-500">— any later change marks the signature invalid.</span>
+                    </span>
+                  </label>
+                  <label className="flex items-start gap-2 text-xs">
+                    <input type="checkbox" checked={prefs.timestamp} onChange={(e) => setPrefs({ timestamp: e.target.checked })} className="mt-0.5" />
+                    <span>
+                      <span className="font-medium">Add trusted timestamp</span>{" "}
+                      <span className="text-gray-500">— RFC 3161; contacts the timestamp server over the internet.</span>
+                    </span>
+                  </label>
+                  {prefs.timestamp && (
+                    <input
+                      value={prefs.tsaUrl}
+                      onChange={(e) => setPrefs({ tsaUrl: e.target.value })}
+                      placeholder="Timestamp server URL"
+                      aria-label="Timestamp server URL"
+                      className={`w-full px-2 py-1.5 rounded-lg border bg-white dark:bg-gray-800 text-xs font-mono ${
+                        isValidTsaUrl(prefs.tsaUrl) ? "border-gray-300 dark:border-gray-600" : "border-red-500"
+                      }`}
+                    />
+                  )}
+                  <label className={`flex items-start gap-2 text-xs ${selfSigned ? "opacity-60" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={prefs.ltv && !selfSigned}
+                      disabled={selfSigned}
+                      onChange={(e) => setPrefs({ ltv: e.target.checked })}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      <span className="font-medium">Make LTV-enabled</span>{" "}
+                      <span className="text-gray-500">
+                        {selfSigned
+                          ? "— needs a CA-issued ID (a self-signed ID has no revocation info to embed)."
+                          : "— embeds OCSP/CRL answers so it still validates after the ID expires (fetched online)."}
+                      </span>
                     </span>
                   </label>
                 </div>
@@ -508,11 +694,27 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
         {tab === "verify" && (
           <div className="space-y-3">
             <button
-              onClick={() => validateDocumentSignatures(docId).then(setReport).catch((e) => notify((e as Error).message, "error"))}
+              onClick={() =>
+                validateDocumentSignatures(docId, { fetchRevocation: prefs.fetchRevocation })
+                  .then(setReport)
+                  .catch((e) => notify((e as Error).message, "error"))
+              }
               className="w-full flex items-center justify-center gap-2 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-xs"
             >
               <FileSearch className="w-4 h-4" /> Check this document
             </button>
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={prefs.fetchRevocation}
+                onChange={(e) => setPrefs({ fetchRevocation: e.target.checked })}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">Check revocation online</span>{" "}
+                <span className="text-gray-500">— asks the issuer&apos;s OCSP/CRL servers whether the ID was revoked.</span>
+              </span>
+            </label>
             {report && <ReportView report={report} />}
             <label className="w-full flex items-center justify-center gap-2 py-1.5 rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-xs cursor-pointer">
               {busy === "verify" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
@@ -525,6 +727,34 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
                 <ReportView report={uploadReport.report} />
               </div>
             )}
+            <div className="rounded-lg border border-gray-200 dark:border-gray-700 p-2 space-y-1.5 text-xs">
+              <div className="font-medium flex items-center gap-1"><ShieldCheck className="w-3.5 h-3.5" /> Trusted certificates</div>
+              <p className="text-[11px] text-gray-500">
+                {trusted
+                  ? `${trusted.system.count} system root certificates (${trusted.system.source === "certifi" ? "Mozilla bundle" : "macOS"}) plus the ones you add.`
+                  : "System root certificates plus the ones you add."}
+              </p>
+              {trusted?.user.map((t) => (
+                <div key={t.fingerprint_sha256} className="flex items-center gap-1">
+                  <span className="flex-1 truncate" title={`${t.subject}\nSHA-256 ${t.fingerprint_sha256}`}>{t.subject}</span>
+                  <button onClick={() => untrust(t.fingerprint_sha256)} aria-label={`Stop trusting ${t.subject}`} className="p-0.5 text-red-600">
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+              <label className="flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline cursor-pointer">
+                <Plus className="w-3 h-3" /> Trust a certificate (.cer)…
+                <input
+                  type="file"
+                  accept=".cer,.crt,.pem,.der,application/pkix-cert,application/x-x509-ca-cert"
+                  className="hidden"
+                  onChange={(e) => {
+                    trustFile(e.target.files?.[0]);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+            </div>
           </div>
         )}
       </div>
@@ -539,6 +769,13 @@ export default function SignPanel({ docId, currentPage, onDocumentChanged, onClo
     </div>
   );
 }
+
+const FACT_TONE = {
+  good: "text-green-700 dark:text-green-400",
+  warn: "text-amber-700 dark:text-amber-400",
+  bad: "text-red-600",
+  neutral: "text-gray-700 dark:text-gray-300",
+} as const;
 
 function ReportView({ report }: { report: ValidationReport }) {
   if (report.signature_count === 0) {
@@ -560,11 +797,23 @@ function ReportView({ report }: { report: ValidationReport }) {
               <Icon className="w-4 h-4" /> {s.signer_name ?? "Unknown signer"}
             </div>
             <div className="text-gray-700 dark:text-gray-300">{s.summary}</div>
-            {s.signing_time && <div className="text-gray-500">Signed {new Date(s.signing_time).toLocaleString()}</div>}
+            <dl className="grid grid-cols-[auto,1fr] gap-x-2 gap-y-0.5 pt-1">
+              {signatureFacts(s).map((f) => (
+                <div key={f.label} className="contents">
+                  <dt className="text-gray-500">{f.label}</dt>
+                  <dd className={FACT_TONE[f.tone]}>{f.value}</dd>
+                </div>
+              ))}
+            </dl>
+            {s.signing_time && (
+              <div className="text-gray-500 flex items-center gap-1">
+                <Clock className="w-3 h-3" /> Signed {new Date(s.signing_time).toLocaleString()}
+              </div>
+            )}
             {s.reason && <div className="text-gray-500">Reason: {s.reason}</div>}
             <div className="text-gray-400">
               {s.certified ? "Certification signature · " : ""}
-              {s.issued_by_this_app ? "ID created in this app" : s.self_signed ? "Self-signed ID" : s.issuer}
+              {s.issued_by_this_app ? "Self-signed ID created in this app" : s.self_signed ? "Self-signed ID" : "CA-issued ID"}
             </div>
           </li>
         );
