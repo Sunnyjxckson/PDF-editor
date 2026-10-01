@@ -241,7 +241,8 @@ export function getExportUrl(docId: string): string {
 }
 
 export function getPdfFileUrl(docId: string): string {
-  return `${API_BASE}/api/pdf/${docId}/export`;
+  // The working file as-is (no re-save), so pdf.js shows exactly what is stored.
+  return `${API_BASE}/api/pdf/${docId}/export?flatten=false`;
 }
 
 // ─── AI Assist ────────────────────────────────────────────────────────────
@@ -398,4 +399,96 @@ export async function getChatHistory(docId: string): Promise<{ role: string; con
   const res = await fetch(`${API_BASE}/api/pdf/${docId}/chat/history`);
   if (!res.ok) throw new Error("Failed to get chat history");
   return res.json();
+}
+
+// ─── History (undo / redo) ──────────────────────────────────────────────────
+
+export interface HistoryEntry {
+  index: number;
+  operation: string;
+  timestamp: string;
+  is_current: boolean;
+}
+
+export interface HistoryState {
+  versions: HistoryEntry[];
+  current: number;
+  can_undo: boolean;
+  can_redo: boolean;
+}
+
+async function errorDetail(res: Response, fallback: string): Promise<Error> {
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") return new Error(body.detail);
+  } catch {
+    // not JSON
+  }
+  return new Error(fallback);
+}
+
+async function postJson<T>(path: string, body: unknown, fallback: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!res.ok) throw await errorDetail(res, fallback);
+  return res.json();
+}
+
+export async function getHistory(docId: string): Promise<HistoryState> {
+  const res = await fetch(`${API_BASE}/api/pdf/${docId}/history`);
+  if (!res.ok) throw await errorDetail(res, "Could not load history");
+  return res.json();
+}
+
+export function undo(docId: string) {
+  return postJson<{ status: string; undone_operation: string; can_undo: boolean; can_redo: boolean }>(
+    `/api/pdf/${docId}/undo`, {}, "Nothing to undo");
+}
+
+export function redo(docId: string) {
+  return postJson<{ status: string; restored_operation: string; can_undo: boolean; can_redo: boolean }>(
+    `/api/pdf/${docId}/redo`, {}, "Nothing to redo");
+}
+
+// ─── Document tools (advanced_ops) ───────────────────────────────────────────
+
+export type PageSelection = "all" | number[];
+
+export function addWatermark(docId: string, opts: {
+  text: string; font_size?: number; color?: number[]; opacity?: number; rotation?: number; pages?: PageSelection;
+}) {
+  return postJson<{ status: string; pages_watermarked: number }>(`/api/pdf/${docId}/watermark`, opts, "Watermark failed");
+}
+
+export function addStamp(docId: string, opts: {
+  text: string; position?: string; font_size?: number; color?: number[]; pages?: PageSelection; margin?: number;
+}) {
+  return postJson<{ status: string; pages_stamped: number }>(`/api/pdf/${docId}/stamp`, opts, "Stamp failed");
+}
+
+export function convertToPdfA(docId: string) {
+  return postJson<{ status: string; note?: string }>(`/api/pdf/${docId}/convert-pdfa`, {}, "PDF/A conversion failed");
+}
+
+export function flattenDocument(docId: string) {
+  return postJson<{ status: string; flattened: number }>(`/api/pdf/${docId}/flatten`, {}, "Flatten failed");
+}
+
+export interface CompareResult {
+  doc1_pages: number;
+  doc2_pages: number;
+  pages_added: number;
+  pages_removed: number;
+  diffs: { page: number; lines_added: number; lines_removed: number; diff: string[] }[];
+}
+
+export function compareDocuments(docId1: string, docId2: string) {
+  return postJson<CompareResult>(`/api/pdf/compare`, { doc_id_1: docId1, doc_id_2: docId2 }, "Compare failed");
+}
+
+export async function deleteDocument(docId: string) {
+  await fetch(`${API_BASE}/api/pdf/${docId}`, { method: "DELETE" });
 }

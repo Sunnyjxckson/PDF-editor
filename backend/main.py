@@ -13,6 +13,14 @@ from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import sys
+
+# Allow both `uvicorn backend.main:app` (repo root) and `cd backend && uvicorn main:app`:
+# every module imports its siblings as `backend.*`, so the repo root must be importable.
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +40,13 @@ from backend.smart_replace import (
     hex_color_to_rgb as _sr_hex_color_to_rgb,
 )
 from backend.advanced_ops import router as advanced_router, snapshot
+from backend.features.text_edit import router as text_edit_router
+from backend.features.objects import router as objects_router
+from backend.features.forms import router as forms_router
+from backend.features.sign import router as sign_router
+from backend.features.redact import router as redact_router
+from backend.features.convert import router as convert_router
+from backend.features.organize import router as organize_router
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -80,6 +95,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI PDF Editor API", lifespan=lifespan)
+# Feature routers are registered before main.py's own @app routes. The ones with
+# literal segments (/api/pdf/ocr/..., /api/pdf/create, /api/pdf/signing/...,
+# /api/pdf/redact/presets) must win over any /api/pdf/{doc_id}/... pattern.
+app.include_router(convert_router)
+app.include_router(sign_router)
+app.include_router(redact_router)
+app.include_router(text_edit_router)
+app.include_router(objects_router)
+app.include_router(forms_router)
+app.include_router(organize_router)
 app.include_router(advanced_router)
 
 app.add_middleware(
@@ -88,6 +113,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -778,6 +804,11 @@ async def export_pdf(doc_id: str, flatten: bool = True):
     if flatten:
         # Flatten all annotations into the PDF for a clean export
         doc = fitz.open(str(file_path))
+        if doc.get_sigflags() > 0:
+            # Digitally signed: any full rewrite would invalidate the signature
+            # (byte ranges change), so hand back the signed file untouched.
+            doc.close()
+            return FileResponse(str(file_path), media_type="application/pdf", filename="edited.pdf")
         for page in doc:
             annots = list(page.annots()) if page.annots() else []
             for annot in annots:

@@ -2,14 +2,30 @@
 
 import { useEffect } from "react";
 import { useEditorStore } from "@/lib/store";
+import { modeForShortcut, activateMode } from "@/lib/modes";
+import { performUndo, performRedo } from "@/lib/history";
+import { useFormsStore } from "@/lib/features/forms";
 import Toolbar from "./Toolbar";
+import ToolRail from "./ToolRail";
 import PageSidebar from "./PageSidebar";
 import PageViewer from "./PageViewer";
+import SidePanel from "./SidePanel";
 import MobileBottomBar from "./MobileBottomBar";
 import FindReplace from "./FindReplace";
 import ChatPanel from "./ChatPanel";
+import AIPanel from "./AIPanel";
 import Toasts from "./Toasts";
 import KeyboardShortcuts from "./KeyboardShortcuts";
+import OrganizeView from "./features/OrganizeView";
+import OrganizeHeaderFooterDialog from "./features/OrganizeHeaderFooterDialog";
+import OrganizeMarkupToolbar from "./features/OrganizeMarkupToolbar";
+
+function isTypingTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+}
 
 export default function Editor() {
   const toggleChat = useEditorStore((s) => s.toggleChat);
@@ -18,6 +34,8 @@ export default function Editor() {
   const setShortcutsOpen = useEditorStore((s) => s.setShortcutsOpen);
   const toggleSidebar = useEditorStore((s) => s.toggleSidebar);
   const setActiveTool = useEditorStore((s) => s.setActiveTool);
+  const activeTool = useEditorStore((s) => s.activeTool);
+  const togglePanel = useEditorStore((s) => s.togglePanel);
   const setCurrentPage = useEditorStore((s) => s.setCurrentPage);
   const currentPage = useEditorStore((s) => s.currentPage);
   const totalPages = useEditorStore((s) => s.totalPages);
@@ -25,27 +43,67 @@ export default function Editor() {
   const setZoom = useEditorStore((s) => s.setZoom);
   const chatPinned = useEditorStore((s) => s.chatPinned);
   const chatOpen = useEditorStore((s) => s.chatOpen);
+  const docId = useEditorStore((s) => s.docId);
+  const docInfo = useEditorStore((s) => s.document);
+  const filename = useEditorStore((s) => s.filename);
+  const pageVersion = useEditorStore((s) => s.pageVersion);
+  const organizeOpen = useEditorStore((s) => s.organizeOpen);
+  const setOrganizeOpen = useEditorStore((s) => s.setOrganizeOpen);
+  const headerFooterOpen = useEditorStore((s) => s.headerFooterOpen);
+  const setHeaderFooterOpen = useEditorStore((s) => s.setHeaderFooterOpen);
+  const markupSettings = useEditorStore((s) => s.markupSettings);
+  const setMarkupSettings = useEditorStore((s) => s.setMarkupSettings);
+  const reloadDocument = useEditorStore((s) => s.reloadDocument);
+
+  // Forms "prepare" mode captures the page pointer; it must not outlive the Forms tool.
+  useEffect(() => {
+    if (activeTool !== "forms") useFormsStore.getState().setPrepareMode(false);
+  }, [activeTool]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't intercept when typing in inputs
-      const tag = (e.target as HTMLElement)?.tagName;
-      const isInput = tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable;
+      // A feature overlay (forms nudge, objects delete...) already handled it.
+      if (e.defaultPrevented) return;
+      const isInput = isTypingTarget(e.target);
+      const mod = e.ctrlKey || e.metaKey;
 
-      // Ctrl/Cmd shortcuts work even in inputs
-      if ((e.ctrlKey || e.metaKey) && e.key === "/") {
+      // Ctrl/Cmd shortcuts that work even in inputs
+      if (mod && e.key === "/") {
         e.preventDefault();
         toggleChat();
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+      if (mod && (e.key === "f" || e.key === "F") && !e.shiftKey) {
         e.preventDefault();
         setFindReplaceOpen(!findReplaceOpen);
         return;
       }
 
-      // Skip remaining shortcuts when in inputs
+      // Skip remaining shortcuts when typing (native undo in text fields stays native)
       if (isInput) return;
+
+      if (mod && !e.altKey) {
+        const k = e.key.toLowerCase();
+        if (k === "z" && !e.shiftKey) {
+          e.preventDefault();
+          void performUndo();
+          return;
+        }
+        if ((k === "z" && e.shiftKey) || k === "y") {
+          e.preventDefault();
+          void performRedo();
+          return;
+        }
+        return; // leave other Ctrl/Cmd combos (copy, print...) to the browser
+      }
+      if (e.altKey) return;
+
+      const mode = modeForShortcut(e.key);
+      if (mode) {
+        e.preventDefault();
+        activateMode(mode, { setActiveTool, togglePanel, setOrganizeOpen, organizeOpen });
+        return;
+      }
 
       switch (e.key) {
         case "?":
@@ -56,34 +114,14 @@ export default function Editor() {
           e.preventDefault();
           toggleSidebar();
           break;
-        case "v":
-        case "V":
-          setActiveTool("select");
-          break;
-        case "s":
-        case "S":
-          setActiveTool("region_select");
-          break;
-        case "t":
-        case "T":
-          setActiveTool("text");
-          break;
-        case "h":
-        case "H":
-          setActiveTool("highlight");
-          break;
-        case "d":
-        case "D":
-          setActiveTool("draw");
-          break;
-        case "e":
-        case "E":
-          setActiveTool("eraser");
-          break;
         case "ArrowLeft":
+        case "PageUp":
+          if (organizeOpen) break;
           if (currentPage > 0) setCurrentPage(currentPage - 1);
           break;
         case "ArrowRight":
+        case "PageDown":
+          if (organizeOpen) break;
           if (currentPage < totalPages - 1) setCurrentPage(currentPage + 1);
           break;
         case "+":
@@ -103,21 +141,58 @@ export default function Editor() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [toggleChat, setFindReplaceOpen, findReplaceOpen, setShortcutsOpen, toggleSidebar, setActiveTool, setCurrentPage, currentPage, totalPages, zoom, setZoom]);
+  }, [toggleChat, setFindReplaceOpen, findReplaceOpen, setShortcutsOpen, toggleSidebar, setActiveTool, togglePanel, setOrganizeOpen, organizeOpen, setCurrentPage, currentPage, totalPages, zoom, setZoom]);
+
+  const changed = () => { void reloadDocument(); };
+  const firstPage = docInfo?.pages[0];
 
   return (
     <div className="h-dvh flex flex-col bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
       <div className="relative">
         <Toolbar />
         <FindReplace />
+        <AIPanel />
       </div>
+      {activeTool === "comment" && !organizeOpen && docId && (
+        <OrganizeMarkupToolbar settings={markupSettings} onChange={setMarkupSettings} docId={docId} />
+      )}
       <div className="flex flex-1 overflow-hidden">
-        <PageSidebar />
-        <PageViewer />
+        <ToolRail />
+        {organizeOpen && docId ? (
+          <div className="flex-1 overflow-hidden">
+            <OrganizeView
+              docId={docId}
+              pageCount={totalPages}
+              currentPage={currentPage}
+              onDocumentChanged={changed}
+              onPageSelect={(p) => { setCurrentPage(p); setOrganizeOpen(false); }}
+              onClose={() => setOrganizeOpen(false)}
+              version={pageVersion}
+              filename={filename ?? undefined}
+            />
+          </div>
+        ) : (
+          <>
+            <PageSidebar />
+            <PageViewer />
+          </>
+        )}
+        <SidePanel />
         {chatOpen && chatPinned && <ChatPanel />}
       </div>
       <MobileBottomBar />
       {chatOpen && !chatPinned && <ChatPanel />}
+      {docId && (
+        <OrganizeHeaderFooterDialog
+          docId={docId}
+          pageCount={totalPages}
+          open={headerFooterOpen}
+          onClose={() => setHeaderFooterOpen(false)}
+          onDocumentChanged={changed}
+          pageWidth={firstPage?.width}
+          pageHeight={firstPage?.height}
+        />
+      )}
       <Toasts />
       <KeyboardShortcuts />
     </div>

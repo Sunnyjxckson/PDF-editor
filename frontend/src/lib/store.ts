@@ -1,9 +1,30 @@
 import { create } from "zustand";
 import type { DocumentInfo, TextBlock } from "./api";
+import { getDocumentInfo } from "./api";
+import { DEFAULT_MARKUP_SETTINGS, type MarkupSettings } from "./features/organize";
 
-export type Tool = "select" | "text" | "highlight" | "draw" | "eraser" | "region_select";
+/**
+ * Page-level interaction modes. Exactly one is active at a time, and each one
+ * owns the pointer on the page: the legacy annotate tools (select ... eraser)
+ * are handled by PageViewer itself, the rest by a feature overlay.
+ */
+export type Tool =
+  | "select" | "text" | "highlight" | "draw" | "eraser" | "region_select"
+  | "edit_text" | "objects" | "comment" | "sign" | "forms" | "redact";
 export type RenderMode = "image" | "pdfjs";
 
+/** Right-hand side panels. sign/forms/redact are tied to the tool of the same name. */
+export type SidePanel =
+  | "sign" | "forms" | "redact" | "comments" | "bookmarks" | "convert" | "protect" | "tools";
+
+/** Tools whose overlay needs a companion side panel. */
+const TOOL_PANEL: Partial<Record<Tool, SidePanel>> = {
+  sign: "sign",
+  forms: "forms",
+  redact: "redact",
+  comment: "comments",
+};
+const PANEL_TOOLS = new Set<Tool>(["sign", "forms", "redact"]);
 export interface Toast {
   id: string;
   message: string;
@@ -29,6 +50,8 @@ interface EditorState {
   // Document
   document: DocumentInfo | null;
   docId: string | null;
+  /** original upload name, used to name downloads */
+  filename: string | null;
   currentPage: number;
   totalPages: number;
   zoom: number;
@@ -57,6 +80,12 @@ interface EditorState {
   darkMode: boolean;
   shortcutsOpen: boolean;
 
+  // Feature workspace
+  activePanel: SidePanel | null;
+  organizeOpen: boolean;
+  headerFooterOpen: boolean;
+  markupSettings: MarkupSettings;
+
   // Toasts
   toasts: Toast[];
 
@@ -71,6 +100,7 @@ interface EditorState {
 
   // Actions
   setDocument: (doc: DocumentInfo, docId: string) => void;
+  setFilename: (name: string | null) => void;
   setCurrentPage: (page: number) => void;
   setZoom: (zoom: number) => void;
   setActiveTool: (tool: Tool) => void;
@@ -101,6 +131,13 @@ interface EditorState {
   revertOptimisticEdit: (id: string) => void;
   bumpVersion: () => void;
   refreshDocument: () => void;
+  /** Re-fetch /info (page count/sizes may have changed) and re-render everything. */
+  reloadDocument: () => Promise<void>;
+  setActivePanel: (panel: SidePanel | null) => void;
+  togglePanel: (panel: SidePanel) => void;
+  setOrganizeOpen: (open: boolean) => void;
+  setHeaderFooterOpen: (open: boolean) => void;
+  setMarkupSettings: (s: MarkupSettings) => void;
   reset: () => void;
 }
 
@@ -114,6 +151,7 @@ function getInitialDarkMode(): boolean {
 export const useEditorStore = create<EditorState>((set, get) => ({
   document: null,
   docId: null,
+  filename: null,
   currentPage: 0,
   totalPages: 0,
   zoom: 1,
@@ -139,6 +177,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   darkMode: getInitialDarkMode(),
   shortcutsOpen: false,
 
+  activePanel: null,
+  organizeOpen: false,
+  headerFooterOpen: false,
+  markupSettings: DEFAULT_MARKUP_SETTINGS,
+
   toasts: [],
 
   textBlocks: [],
@@ -148,10 +191,36 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   optimisticEdits: [],
 
   setDocument: (doc, docId) =>
-    set({ document: doc, docId, totalPages: doc.page_count, currentPage: 0, pageVersion: 0, pdfVersion: 0 }),
+    set((s) =>
+      // Re-setting the SAME document (after a page op) must keep moving the
+      // version counters forward: page images, thumbnails, text blocks and the
+      // pdf.js document are all cached by version, so resetting to 0 would
+      // serve stale renders from before the change.
+      s.docId === docId
+        ? {
+            document: doc,
+            totalPages: doc.page_count,
+            currentPage: Math.max(0, Math.min(s.currentPage, doc.page_count - 1)),
+            pageVersion: s.pageVersion + 1,
+            pdfVersion: s.pdfVersion + 1,
+          }
+        : { document: doc, docId, totalPages: doc.page_count, currentPage: 0, pageVersion: 0, pdfVersion: 0 },
+    ),
+  setFilename: (filename) => set({ filename }),
   setCurrentPage: (page) => set({ currentPage: page }),
   setZoom: (zoom) => set({ zoom: Math.max(0.25, Math.min(3, zoom)) }),
-  setActiveTool: (tool) => set({ activeTool: tool }),
+  setActiveTool: (tool) =>
+    set((s) => {
+      const next: Partial<EditorState> = { activeTool: tool, regionSelection: null };
+      const panel = TOOL_PANEL[tool];
+      if (panel) next.activePanel = panel;
+      // Leaving sign/forms/redact closes its panel (and with it the overlay).
+      else if (s.activePanel && PANEL_TOOLS.has(s.activePanel as Tool)) next.activePanel = null;
+      if (tool === "comment" && !s.markupSettings.tool) {
+        next.markupSettings = { ...s.markupSettings, tool: "highlight" };
+      }
+      return next;
+    }),
   setDrawColor: (color) => set({ drawColor: color }),
   setDrawWidth: (width) => set({ drawWidth: width }),
   setHighlightColor: (color) => set({ highlightColor: color }),
@@ -193,10 +262,40 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   refreshDocument: () => {
     set((s) => ({ pageVersion: s.pageVersion + 1, pdfVersion: s.pdfVersion + 1 }));
   },
+  reloadDocument: async () => {
+    const { docId } = get();
+    if (!docId) return;
+    try {
+      const info = await getDocumentInfo(docId);
+      if (get().docId !== docId) return;
+      get().setDocument(info, docId); // bumps versions for the same doc
+    } catch {
+      get().bumpVersion();
+    }
+  },
+  setActivePanel: (panel) =>
+    set((s) => {
+      const next: Partial<EditorState> = { activePanel: panel };
+      if (panel && PANEL_TOOLS.has(panel as Tool)) next.activeTool = panel as Tool;
+      else if (PANEL_TOOLS.has(s.activeTool)) next.activeTool = "select";
+      return next;
+    }),
+  togglePanel: (panel) => get().setActivePanel(get().activePanel === panel ? null : panel),
+  setOrganizeOpen: (open) =>
+    set((s) =>
+      // The page overlays are gone while Organize replaces the viewer, so drop
+      // a sign/forms/redact mode (and its panel) instead of leaving it dangling.
+      open && PANEL_TOOLS.has(s.activeTool)
+        ? { organizeOpen: true, activeTool: "select", activePanel: null }
+        : { organizeOpen: open },
+    ),
+  setHeaderFooterOpen: (open) => set({ headerFooterOpen: open }),
+  setMarkupSettings: (markupSettings) => set({ markupSettings }),
   reset: () =>
     set({
       document: null,
       docId: null,
+      filename: null,
       currentPage: 0,
       totalPages: 0,
       zoom: 1,
@@ -208,5 +307,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       regionSelection: null,
       textBlocks: [],
       optimisticEdits: [],
+      activePanel: null,
+      organizeOpen: false,
+      headerFooterOpen: false,
     }),
 }));

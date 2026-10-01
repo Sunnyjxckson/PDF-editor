@@ -75,12 +75,10 @@ export default function ChatPanel() {
     }
   }, [chatOpen]);
 
-  // Welcome message
-  useEffect(() => {
-    if (chatOpen && messages.length === 0) {
-      setMessages([WELCOME_MESSAGE]);
-    }
-  }, [chatOpen, messages.length]);
+  // Welcome message (state derived during render, React's recommended pattern)
+  if (chatOpen && messages.length === 0) {
+    setMessages([WELCOME_MESSAGE]);
+  }
 
   // Cleanup stream on unmount
   useEffect(() => {

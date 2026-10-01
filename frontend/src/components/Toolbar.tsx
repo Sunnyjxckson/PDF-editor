@@ -1,11 +1,7 @@
 "use client";
 
+import { useState } from "react";
 import {
-  MousePointer2,
-  Type,
-  Highlighter,
-  Pencil,
-  Eraser,
   ZoomIn,
   ZoomOut,
   RotateCw,
@@ -23,21 +19,15 @@ import {
   Redo2,
   Sun,
   Moon,
-  ScanSearch,
+  History,
+  Keyboard,
 } from "lucide-react";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { useEditorStore, type Tool } from "@/lib/store";
-import { rotatePage, deletePage, getExportUrl, getDocumentInfo } from "@/lib/api";
-
-const tools: { id: Tool; icon: typeof MousePointer2; label: string; shortcut: string }[] = [
-  { id: "select", icon: MousePointer2, label: "Select", shortcut: "V" },
-  { id: "region_select", icon: ScanSearch, label: "Select Region", shortcut: "S" },
-  { id: "text", icon: Type, label: "Text", shortcut: "T" },
-  { id: "highlight", icon: Highlighter, label: "Highlight", shortcut: "H" },
-  { id: "draw", icon: Pencil, label: "Draw", shortcut: "D" },
-  { id: "eraser", icon: Eraser, label: "Eraser", shortcut: "E" },
-];
+import { useEditorStore } from "@/lib/store";
+import { rotatePage, deletePage, getExportUrl, getDocumentInfo, getHistory, type HistoryState } from "@/lib/api";
+import { MODES, activateMode, isModeActive } from "@/lib/modes";
+import { performUndo, performRedo } from "@/lib/history";
 
 const zoomPresets = [
   { label: "50%", value: 0.5 },
@@ -125,6 +115,24 @@ export default function Toolbar() {
 
   const fontSize = useEditorStore((s) => s.fontSize);
   const setFontSize = useEditorStore((s) => s.setFontSize);
+  const activePanel = useEditorStore((s) => s.activePanel);
+  const organizeOpen = useEditorStore((s) => s.organizeOpen);
+  const togglePanel = useEditorStore((s) => s.togglePanel);
+  const setOrganizeOpen = useEditorStore((s) => s.setOrganizeOpen);
+  const setShortcutsOpen = useEditorStore((s) => s.setShortcutsOpen);
+  const pageVersion = useEditorStore((s) => s.pageVersion);
+  const [history, setHistory] = useState<HistoryState | null>(null);
+  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  const mod = isMac ? "Cmd" : "Ctrl";
+
+  const loadHistory = async () => {
+    if (!docId) return;
+    try {
+      setHistory(await getHistory(docId));
+    } catch {
+      setHistory(null);
+    }
+  };
 
   const handleRotate = async () => {
     if (!docId || !docInfo) return;
@@ -156,9 +164,6 @@ export default function Toolbar() {
 
   const btnBase =
     "p-2 rounded-lg transition-colors text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800";
-  const btnActive =
-    "p-2 rounded-lg transition-colors bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400";
-
   return (
     <Tooltip.Provider delayDuration={300}>
       {/* Top toolbar */}
@@ -187,21 +192,6 @@ export default function Toolbar() {
         </TooltipButton>
 
         <Divider />
-
-        {/* Tools - desktop */}
-        <div className="hidden sm:flex items-center gap-0.5">
-          {tools.map((tool) => (
-            <TooltipButton
-              key={tool.id}
-              label={tool.label}
-              shortcut={tool.shortcut}
-              onClick={() => setActiveTool(tool.id)}
-              className={activeTool === tool.id ? btnActive : btnBase}
-            >
-              <tool.icon className="w-5 h-5" />
-            </TooltipButton>
-          ))}
-        </div>
 
         {/* Contextual tool options */}
         {activeTool === "draw" && (
@@ -274,24 +264,51 @@ export default function Toolbar() {
 
         <Divider />
 
-        {/* Undo / Redo */}
+        {/* Undo / Redo / History */}
         <div className="hidden sm:flex items-center gap-0.5">
-          <TooltipButton
-            label="Undo"
-            shortcut="Coming soon"
-            className={`${btnBase} opacity-40 cursor-not-allowed`}
-            disabled
-          >
+          <TooltipButton label="Undo" shortcut={`${mod}+Z`} onClick={() => void performUndo()} className={btnBase}>
             <Undo2 className="w-5 h-5" />
           </TooltipButton>
-          <TooltipButton
-            label="Redo"
-            shortcut="Coming soon"
-            className={`${btnBase} opacity-40 cursor-not-allowed`}
-            disabled
-          >
+          <TooltipButton label="Redo" shortcut={`${mod}+Shift+Z`} onClick={() => void performRedo()} className={btnBase}>
             <Redo2 className="w-5 h-5" />
           </TooltipButton>
+          <DropdownMenu.Root onOpenChange={(open) => { if (open) void loadHistory(); }}>
+            <DropdownMenu.Trigger asChild>
+              <button className={btnBase} aria-label="Edit history" title="Edit history" data-version={pageVersion}>
+                <History className="w-5 h-5" />
+              </button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                className="w-72 max-h-80 overflow-y-auto bg-white dark:bg-gray-800 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 py-1 z-[100] text-sm"
+                sideOffset={5}
+                align="start"
+              >
+                <DropdownMenu.Label className="px-3 py-1.5 text-xs font-semibold text-gray-500 dark:text-gray-400">Edit history</DropdownMenu.Label>
+                {!history || history.versions.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-gray-500">No changes yet</div>
+                ) : (
+                  history.versions
+                    .filter((v) => !v.operation.startsWith("("))
+                    .slice()
+                    .reverse()
+                    .map((v) => (
+                      <div
+                        key={v.index}
+                        className={`px-3 py-1.5 text-xs flex justify-between gap-2 ${v.index > history.current ? "text-gray-400 line-through" : "text-gray-700 dark:text-gray-200"}`}
+                        title={v.index > history.current ? "Undone (can be redone)" : undefined}
+                      >
+                        <span className="truncate">{v.operation}</span>
+                        <span className="shrink-0 tabular-nums text-gray-400">{new Date(v.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                      </div>
+                    ))
+                )}
+                <DropdownMenu.Separator className="h-px bg-gray-200 dark:bg-gray-700 my-1" />
+                <DropdownMenu.Item onSelect={() => void performUndo()} disabled={!history?.can_undo} className="px-3 py-1.5 text-xs cursor-pointer outline-none data-[disabled]:opacity-40 hover:bg-gray-100 dark:hover:bg-gray-700">Undo last change</DropdownMenu.Item>
+                <DropdownMenu.Item onSelect={() => void performRedo()} disabled={!history?.can_redo} className="px-3 py-1.5 text-xs cursor-pointer outline-none data-[disabled]:opacity-40 hover:bg-gray-100 dark:hover:bg-gray-700">Redo</DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
         </div>
 
         <Divider />
@@ -300,7 +317,6 @@ export default function Toolbar() {
         <div className="hidden sm:flex items-center gap-0.5">
           <TooltipButton
             label="Rotate page"
-            shortcut="R"
             onClick={handleRotate}
             className={btnBase}
           >
@@ -439,6 +455,15 @@ export default function Toolbar() {
 
         <div className="hidden sm:block w-px h-6 bg-gray-200 dark:bg-gray-700" />
 
+        <TooltipButton
+          label="Keyboard shortcuts"
+          shortcut="?"
+          onClick={() => setShortcutsOpen(true)}
+          className={`hidden md:flex ${btnBase}`}
+        >
+          <Keyboard className="w-5 h-5" />
+        </TooltipButton>
+
         {/* Dark mode toggle - desktop */}
         <TooltipButton
           label="Toggle dark mode"
@@ -464,27 +489,39 @@ export default function Toolbar() {
         <div className="sm:hidden bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 p-3 space-y-3">
           {/* Tool buttons */}
           <div className="flex items-center gap-1 justify-center flex-wrap">
-            {tools.map((tool) => (
+            {MODES.map((mode) => (
               <button
-                key={tool.id}
+                key={mode.id}
                 onClick={() => {
-                  setActiveTool(tool.id);
+                  activateMode(mode, { setActiveTool, togglePanel, setOrganizeOpen, organizeOpen });
                   toggleMobileMenu();
                 }}
-                className={`p-3 rounded-lg transition-colors flex flex-col items-center gap-1 ${
-                  activeTool === tool.id
-                    ? "bg-blue-100 dark:bg-blue-900/40 text-blue-600"
-                    : "hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600"
+                className={`p-2 w-[72px] rounded-lg transition-colors flex flex-col items-center gap-1 ${
+                  isModeActive(mode, { activeTool, activePanel, organizeOpen })
+                    ? "bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-300"
+                    : "hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300"
                 }`}
               >
-                <tool.icon className="w-5 h-5" />
-                <span className="text-[10px]">{tool.label}</span>
+                <mode.icon className="w-5 h-5" />
+                <span className="text-[10px]">{mode.label}</span>
               </button>
             ))}
           </div>
 
           {/* Actions */}
           <div className="flex items-center gap-2 justify-center flex-wrap">
+            <button
+              onClick={() => void performUndo()}
+              className="flex items-center gap-1 px-3 py-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-sm"
+            >
+              <Undo2 className="w-4 h-4" /> Undo
+            </button>
+            <button
+              onClick={() => void performRedo()}
+              className="flex items-center gap-1 px-3 py-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-sm"
+            >
+              <Redo2 className="w-4 h-4" /> Redo
+            </button>
             <button
               onClick={() => {
                 handleRotate();

@@ -23,6 +23,12 @@ import {
   getCurrentPdfDoc,
 } from "@/lib/pdf-renderer";
 import { Loader2, Monitor, FileImage } from "lucide-react";
+import TextEditOverlay from "./features/TextEditOverlay";
+import ObjectsOverlay from "./features/ObjectsOverlay";
+import OrganizeMarkupOverlay from "./features/OrganizeMarkupOverlay";
+import FormsOverlay from "./features/FormsOverlay";
+import RedactOverlay from "./features/RedactOverlay";
+import SignOverlay from "./features/SignOverlay";
 
 const RENDER_DPI = 150;
 const PDF_SCALE = RENDER_DPI / 72;
@@ -49,6 +55,7 @@ export default function PageViewer() {
     addOptimisticEdit, resolveOptimisticEdit, revertOptimisticEdit,
     optimisticEdits, addToast,
     regionSelection, setRegionSelection, setChatOpen,
+    markupSettings, setActiveTool,
   } = useEditorStore();
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -72,7 +79,6 @@ export default function PageViewer() {
   const [textBlocks, setTextBlocks] = useState<TextBlock[]>([]);
   const [editingBlock, setEditingBlock] = useState<TextBlock | null>(null);
   const [editText_, setEditText_] = useState("");
-  const [showTextBlocks, setShowTextBlocks] = useState(false);
   const [addingText, setAddingText] = useState<{ x: number; y: number } | null>(null);
   const [newText, setNewText] = useState("");
 
@@ -119,7 +125,6 @@ export default function PageViewer() {
     let cancelled = false;
 
     const renderWithPdfJs = async () => {
-      setLoading(true);
       try {
         const pdfUrl = getPdfFileUrl(docId);
         const doc = await loadPdfDocument(pdfUrl, docId, pdfVersion);
@@ -145,45 +150,48 @@ export default function PageViewer() {
     };
 
     renderWithPdfJs();
-    setAllPaths([]);
-    setEditingBlock(null);
-    setAddingText(null);
-    setHighlightRect(null);
-    setShowTextBlocks(false);
-    setSelectedBlock(null);
-    setDragRect(null);
-    setRegionStart(null);
-    setRegionDragRect(null);
-
     return () => { cancelled = true; };
   }, [docId, currentPage, pdfVersion, renderMode]);
 
-  // ─── Image-based Rendering (existing) ───────────────────────────────
-  useEffect(() => {
-    if (!docId || renderMode !== "image") return;
-    setLoading(true);
-    setImgSrc(`${getPageUrl(docId, currentPage, RENDER_DPI)}&v=${pageVersion}`);
+  // ─── Reset per-page UI when the page, its version or the render mode changes ──
+  // Done during render (React's "adjust state when a prop changes" pattern), so
+  // the stale page never paints with the new page's overlays.
+  const viewKey = docId ? `${docId}|${currentPage}|${renderMode}|${renderMode === "pdfjs" ? pdfVersion : pageVersion}` : null;
+  const [lastViewKey, setLastViewKey] = useState<string | null>(null);
+  if (viewKey !== lastViewKey) {
+    setLastViewKey(viewKey);
+    if (docId) {
+      setLoading(true);
+      if (renderMode === "image") setImgSrc(`${getPageUrl(docId, currentPage, RENDER_DPI)}&v=${pageVersion}`);
+    }
     setAllPaths([]);
     setEditingBlock(null);
     setAddingText(null);
     setHighlightRect(null);
-    setShowTextBlocks(false);
     setSelectedBlock(null);
     setDragRect(null);
     setRegionStart(null);
     setRegionDragRect(null);
-  }, [docId, currentPage, pageVersion, renderMode]);
+  }
+  const [lastTool, setLastTool] = useState(activeTool);
+  if (lastTool !== activeTool) {
+    setLastTool(activeTool);
+    setSelectedBlock(null);
+    setDragRect(null);
+    setEditingBlock(null);
+    setAddingText(null);
+  }
+  const showTextBlocks = activeTool === "text";
 
   // ─── Load text blocks for text tool (with cache) ────────────────────
   useEffect(() => {
-    if (!docId || activeTool !== "text") { setShowTextBlocks(false); return; }
-    setShowTextBlocks(true);
+    if (!docId || activeTool !== "text") return;
     fetchTextBlocksCached(currentPage).then(setTextBlocks);
   }, [docId, currentPage, activeTool, pageVersion, fetchTextBlocksCached]);
 
   // ─── Load content blocks for select tool (with cache) ───────────────
   useEffect(() => {
-    if (!docId || activeTool !== "select") { setContentBlocks([]); setSelectedBlock(null); return; }
+    if (!docId || activeTool !== "select") return;
     fetchTextBlocksCached(currentPage).then((spans) => {
       const blocks: ContentBlock[] = [];
       const grouped = new Set<number>();
@@ -233,14 +241,6 @@ export default function PageViewer() {
 
   // ─── Canvas Drawing ──────────────────────────────────────────────────
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || imgSize.w === 0) return;
-    canvas.width = imgSize.w;
-    canvas.height = imgSize.h;
-    redrawCanvas();
-  }, [imgSize, allPaths, drawPoints, highlightRect, regionDragRect]);
-
   const redrawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -269,6 +269,14 @@ export default function PageViewer() {
       ctx.strokeRect(highlightRect.x, highlightRect.y, highlightRect.w, highlightRect.h);
     }
   }, [allPaths, drawPoints, highlightRect, drawColor, drawWidth, highlightColor]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || imgSize.w === 0) return;
+    canvas.width = imgSize.w;
+    canvas.height = imgSize.h;
+    redrawCanvas();
+  }, [imgSize, regionDragRect, redrawCanvas]);
 
   const getCanvasPos = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -603,12 +611,20 @@ export default function PageViewer() {
 
   if (!docId) return null;
 
+  // Visible page size in PDF points (/info is rotation-applied). Fall back to
+  // the rendered size if /info is stale for a moment after a page operation.
+  const pageInfo = docInfo?.pages[currentPage];
+  const pageWidthPt = pageInfo?.width ?? imgSize.w / currentScale;
+  const pageHeightPt = pageInfo?.height ?? imgSize.h / currentScale;
+  const overlayReady = !loading && imgSize.w > 0;
+  const notify = (message: string, type?: "success" | "error" | "info") => addToast(message, type ?? "info");
+
   const selRect = dragRect || selectedBlock?.screenBbox;
 
   return (
     <div
       ref={containerRef}
-      className="flex-1 overflow-auto bg-gray-100 dark:bg-gray-950 flex items-start justify-center p-2 sm:p-4 lg:p-8"
+      className="flex-1 overflow-auto bg-gray-100 dark:bg-gray-950 flex items-start justify-center-safe p-2 sm:p-4 lg:p-8"
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
@@ -673,6 +689,62 @@ export default function PageViewer() {
             style={{ pointerEvents: (activeTool === "draw" || activeTool === "highlight" || activeTool === "eraser" || activeTool === "region_select") ? "auto" : "none" }}
             onMouseDown={handleCanvasMouseDown} onMouseMove={handleCanvasMouseMove}
             onMouseUp={handleCanvasMouseUp} onMouseLeave={handleCanvasMouseUp} />
+        )}
+
+        {/* Feature overlays: exactly one, chosen by the active tool */}
+        {overlayReady && activeTool === "edit_text" && (
+          <TextEditOverlay
+            docId={docId}
+            currentPage={currentPage}
+            pxPerPt={currentScale}
+            refreshKey={pageVersion}
+            onDocumentChanged={bumpVersion}
+            onMessage={notify}
+          />
+        )}
+        {overlayReady && activeTool === "objects" && (
+          <ObjectsOverlay
+            docId={docId}
+            currentPage={currentPage}
+            pageVersion={pageVersion}
+            onDocumentChanged={bumpVersion}
+            onNotify={notify}
+            onExit={() => setActiveTool("select")}
+          />
+        )}
+        {overlayReady && activeTool === "comment" && (
+          <OrganizeMarkupOverlay
+            docId={docId}
+            page={currentPage}
+            pageWidth={pageWidthPt}
+            pageHeight={pageHeightPt}
+            settings={markupSettings}
+            onCreated={() => bumpVersion()}
+            onError={(m) => addToast(m, "error")}
+          />
+        )}
+        {overlayReady && activeTool === "forms" && (
+          <FormsOverlay
+            docId={docId}
+            currentPage={currentPage}
+            pageWidth={pageWidthPt}
+            pageHeight={pageHeightPt}
+            onDocumentChanged={bumpVersion}
+            refreshKey={pageVersion}
+          />
+        )}
+        {overlayReady && activeTool === "redact" && (
+          <RedactOverlay
+            docId={docId}
+            currentPage={currentPage}
+            pageWidth={pageWidthPt}
+            pageHeight={pageHeightPt}
+            onDocumentChanged={bumpVersion}
+            onError={(m) => addToast(m, "error")}
+          />
+        )}
+        {overlayReady && activeTool === "sign" && (
+          <SignOverlay pageIndex={currentPage} pageWidthPt={pageWidthPt} pageHeightPt={pageHeightPt} />
         )}
 
         {/* Optimistic text overlays */}
@@ -796,6 +868,18 @@ export default function PageViewer() {
           );
         })}
 
+        {/* Click-to-add text: below the existing-text boxes so empty space adds
+            new text and clicking a box edits it (previously this layer was
+            pointer-events:none whenever the tool was on, so it never fired) */}
+        {activeTool === "text" && !loading && !editingBlock && (
+          <div className="absolute top-0 left-0 w-full h-full" style={{ cursor: "text" }}
+            onClick={(e) => {
+              const rect = (e.target as HTMLElement).getBoundingClientRect();
+              setAddingText({ x: (e.clientX - rect.left) * (imgSize.w / rect.width), y: (e.clientY - rect.top) * (imgSize.h / rect.height) });
+              setNewText("");
+            }} />
+        )}
+
         {/* Text block overlays (text tool) */}
         {showTextBlocks && !loading && textBlocks.map((block, i) => {
           const [x0, y0, x1, y1] = block.bbox.map((v) => v * currentScale);
@@ -805,16 +889,6 @@ export default function PageViewer() {
               onClick={(e) => { e.stopPropagation(); setEditingBlock(block); setEditText_(block.text); }} />
           );
         })}
-
-        {/* Click-to-add text */}
-        {activeTool === "text" && !loading && !editingBlock && (
-          <div className="absolute top-0 left-0 w-full h-full" style={{ pointerEvents: showTextBlocks ? "none" : "auto" }}
-            onClick={(e) => {
-              const rect = (e.target as HTMLElement).getBoundingClientRect();
-              setAddingText({ x: (e.clientX - rect.left) * (imgSize.w / rect.width), y: (e.clientY - rect.top) * (imgSize.h / rect.height) });
-              setNewText("");
-            }} />
-        )}
 
         {/* Text editing popup */}
         {editingBlock && (

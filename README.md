@@ -60,14 +60,33 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## Features
 
-- Upload and view PDFs with page thumbnails
-- Edit, add, and move text
-- Find and replace across all pages
-- Highlight and freehand drawing annotations
-- Rotate, delete, reorder, and split pages
-- AI chat: natural language commands ("replace X with Y", "delete page 3", "extract all emails")
-- Export with flattened annotations
-- Dark mode, keyboard shortcuts, mobile-responsive
+The editor has an Acrobat-style tool rail on the left. Each mode owns the page while it is active, so only one overlay is live at a time. Single-key shortcuts are shown in brackets, and `?` lists them all.
+
+**Edit**
+- **Edit text** [E]: edit existing text in place by paragraph, line or run. Paragraphs reflow inside their original column. The embedded font is reused, and size, colour, weight and alignment are kept. You can also move or delete text and change its font, size, colour, bold or italic.
+- **Add text** [T]: click anywhere to add new text, or click an existing text box to rewrite it.
+- **Objects** [O]: move, resize, rotate, crop, replace, extract and delete images. Insert images. Draw real vector shapes (rectangle, ellipse, line, arrow). Move or delete vector art.
+- **Select** [V]: move or resize text blocks.
+
+**Review**
+- **Comment** [C]: sticky notes, highlight, underline, strikeout, squiggly, text boxes, callouts, shapes, ink and stamps, saved as real PDF annotations that Acrobat can read. The comments panel has threaded replies, review status and filters.
+- Quick **Highlight** [H], **Draw** [D], **Eraser** [Shift+E] and **Ask AI** about a region [S].
+
+**Prepare**
+- **Fill & Sign** [G]: a library of drawn, typed or uploaded signatures and initials, plus text, date, check and cross items. You can lock the document after signing. Self-signed digital IDs and PAdES digital signatures (pyHanko), with signature verification for this or any uploaded PDF.
+- **Forms** [F]: fill every field type. Create, edit, move and delete fields. Auto-detect fields on flat forms. Import and export JSON, FDF or XFDF. Flatten.
+- **Redact** [R]: true redaction that removes text, image pixels and vector art. Search by text or regex, with PII presets (SSN, phone, email, card numbers with a Luhn check, dates, money, addresses). Every apply is verified. The Sanitize tab removes metadata, hidden text, JavaScript, attachments and links.
+
+**Document**
+- **Organize** [P]: a thumbnail grid with drag reorder, insert blank pages, insert pages from another file, extract, duplicate, rotate, delete, crop (including auto-crop of white margins), resize and split. Also bookmarks.
+- **Convert**: OCR that adds a searchable or editable text layer (Tesseract), plus export to Word, Excel, CSV, Markdown, HTML, TXT, PNG or JPG. Create a PDF from images, text, Markdown or DOCX. Compress.
+- **Protect**: AES-256 open and permission passwords, as a protected download or as restrictions on the working copy. Remove security.
+- **More**: watermark, header and footer with page numbers and Bates numbering (live preview), quick text stamps, bookmarks, flatten, PDF/A-style archival clean-up, compare two documents, AI page actions.
+
+**Everywhere**
+- Undo and redo for every change from every tool (Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z), with an edit-history menu.
+- Find and replace (Cmd/Ctrl+F), AI chat (Cmd/Ctrl+/), server rendering or PDF.js rendering, dark mode, and a mobile layout.
+- Downloads of digitally signed documents are byte-for-byte copies of the stored file, so signatures stay valid.
 
 ## API Endpoints
 
@@ -96,6 +115,38 @@ Open [http://localhost:3000](http://localhost:3000).
 | `POST` | `/api/pdf/{id}/chat` | Natural language chat |
 | `GET` | `/api/ai/status` | AI availability check |
 | `DELETE` | `/api/pdf/{id}` | Delete document |
+
+### Editing tools (`backend/advanced_ops.py`)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/pdf/{id}/undo`, `/redo` | Step through snapshot history |
+| `GET` | `/api/pdf/{id}/history` | List undo/redo states |
+| `POST` | `/api/pdf/{id}/watermark`, `/stamp` | Text watermark / positioned text stamp |
+| `POST` | `/api/pdf/{id}/flatten` | Bake annotations and form fields into the page (pending redaction marks are kept) |
+| `POST` | `/api/pdf/{id}/convert-pdfa` | Archival clean-up (fonts, scripts, form values baked) |
+| `POST` | `/api/pdf/compare` | Text diff of two uploaded documents |
+| `GET/POST/DELETE` | `/api/pdf/{id}/images`, `/add-image`, `/image/{page}/{i}` | Legacy image operations |
+
+### Feature modules (`backend/features/`)
+
+Every rect and point is in PDF points with a top-left origin, in the page as displayed (rotation applied). That is the same space as `/info` page width and height. Every change takes an undo snapshot first.
+
+| Module | Endpoints (prefix `/api/pdf`) |
+|--------|-------------------------------|
+| `text_edit.py` | `GET /{id}/text-edit/page/{n}`; `POST /{id}/text-edit/edit`, `/move`, `/delete` |
+| `objects.py` | `GET /{id}/objects/{n}`; `POST /{id}/objects/image/move`, `/rotate`, `/delete`, `/crop`, `/replace`, `/insert`; `GET /{id}/objects/image/{xref}/extract`; `POST /{id}/objects/drawing/move`, `/delete`; `POST /{id}/objects/shape` |
+| `forms.py` | `GET/POST /{id}/form-fields`; `PATCH/DELETE /{id}/form-fields/{fid}`; `POST /{id}/form-fields/fill`, `/flatten`, `/detect`, `/import`; `GET /{id}/form-fields/export` |
+| `sign.py` | `POST /{id}/sign/apply`, `/stamp`, `/lock`, `/digital`; `GET /{id}/sign/validate`; `POST/GET/DELETE /signing/certificates[/{cert}]`; `POST /signing/validate` |
+| `redact.py` | `GET /{id}/redact/words/{n}`; `POST /{id}/redact/mark`, `/apply`, `/search`; `GET/DELETE /{id}/redact/marks`; `GET /redact/presets`; `GET /{id}/security/audit`; `POST /{id}/security/sanitize`, `/protect`, `/unlock` |
+| `convert.py` | `GET /ocr/languages`; `GET /{id}/ocr/detect`; `POST /{id}/ocr` and `GET /ocr/jobs/{job}`; `GET /{id}/export/{docx,txt,md,html,png,jpg,xlsx,csv}`; `POST /create`; `POST /{id}/compress` |
+| `organize.py` | `POST /{id}/organize/insert-blank`, `insert-file`, `extract`, `duplicate`, `rotate`, `delete`, `crop`, `resize`, `split`, `page-numbers`, `bates`, `header-footer[/preview]`; bookmarks (`GET/PUT/POST /{id}/organize/bookmarks`, `PATCH/DELETE .../{i}`); comments (`GET/POST /{id}/organize/comments`, `.../{xref}/reply`, `.../{xref}/status`, `PATCH/DELETE .../{xref}`); `GET /{id}/organize/stamps` |
+
+Interactive docs for every route are at `http://localhost:8000/docs`.
+
+### System requirements
+
+OCR needs the Tesseract binary and its language data. On macOS run `brew install tesseract`; the Docker image installs `tesseract-ocr`. Without Tesseract, `/ocr` returns a clear 400 or 503 error and everything else keeps working.
 
 ## Environment Variables
 

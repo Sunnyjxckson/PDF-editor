@@ -40,6 +40,7 @@ export default function UploadScreen() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const setDocument = useEditorStore((s) => s.setDocument);
+  const setFilename = useEditorStore((s) => s.setFilename);
 
   const handleFile = useCallback(
     async (file: File) => {
@@ -53,13 +54,14 @@ export default function UploadScreen() {
         const result = await uploadPDF(file);
         const info = await getDocumentInfo(result.id);
         setDocument(info, result.id);
+        setFilename(result.filename || file.name);
       } catch {
         setError("Failed to upload PDF. Make sure the backend is running.");
       } finally {
         setUploading(false);
       }
     },
-    [setDocument]
+    [setDocument, setFilename]
   );
 
   const handleDrop = useCallback(

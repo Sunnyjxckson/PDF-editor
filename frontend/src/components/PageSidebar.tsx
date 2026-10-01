@@ -68,11 +68,9 @@ export default function PageSidebar() {
   // Virtual scrolling via scroll position calculation
   useEffect(() => {
     const sidebar = sidebarRef.current;
-    if (!sidebar || totalPages <= 30) {
-      // For small documents, render all
-      setVisibleRange({ start: 0, end: totalPages });
-      return;
-    }
+    // Small documents render every thumbnail (useVirtualScrolling is false),
+    // so there is no range to track.
+    if (!sidebar || totalPages <= 30) return;
 
     const handleScroll = () => {
       const scrollTop = sidebar.scrollTop;
@@ -416,7 +414,12 @@ function CachedThumbnail({ docId, pageIndex, pageVersion }: { docId: string; pag
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState(false);
-  const [src, setSrc] = useState<string | null>(null);
+  // Blob URL made after the first load, tagged with what it is a render of.
+  const [blob, setBlob] = useState<{ key: string; url: string } | null>(null);
+  const key = `${docId}-${pageIndex}-${pageVersion}`;
+  const cached = isVisible ? getCachedThumbnail(docId, pageIndex, pageVersion) : undefined;
+  const url = isVisible ? `${getThumbnailUrl(docId, pageIndex)}?v=${pageVersion}` : null;
+  const src = cached ?? (blob?.key === key ? blob.url : url);
 
   // IntersectionObserver for lazy loading
   useEffect(() => {
@@ -437,42 +440,35 @@ function CachedThumbnail({ docId, pageIndex, pageVersion }: { docId: string; pag
     return () => observer.disconnect();
   }, []);
 
-  // Load thumbnail when visible
+  // When visible, load once and keep a blob URL in the shared cache
   useEffect(() => {
-    if (!isVisible) return;
-
-    // Check cache first
-    const cached = getCachedThumbnail(docId, pageIndex, pageVersion);
-    if (cached) {
-      setSrc(cached);
-      return;
-    }
-
-    // Load and cache
-    const url = `${getThumbnailUrl(docId, pageIndex)}?v=${pageVersion}`;
-    setSrc(url);
-
-    // Cache after load
+    if (!isVisible || !url || getCachedThumbnail(docId, pageIndex, pageVersion)) return;
+    let cancelled = false;
     const img = new Image();
+    // The API is another origin: without CORS mode the canvas is tainted and
+    // toBlob() throws. The backend allows any origin.
+    img.crossOrigin = "anonymous";
     img.onload = () => {
-      // Create a blob URL from the loaded image for caching
       const canvas = document.createElement("canvas");
       canvas.width = img.naturalWidth;
       canvas.height = img.naturalHeight;
       const ctx = canvas.getContext("2d");
-      if (ctx) {
-        ctx.drawImage(img, 0, 0);
-        canvas.toBlob((blob) => {
-          if (blob) {
-            const blobUrl = URL.createObjectURL(blob);
-            setCachedThumbnail(docId, pageIndex, pageVersion, blobUrl);
-            setSrc(blobUrl);
-          }
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      try {
+        canvas.toBlob((b) => {
+          if (!b || cancelled) return;
+          const blobUrl = URL.createObjectURL(b);
+          setCachedThumbnail(docId, pageIndex, pageVersion, blobUrl);
+          setBlob({ key, url: blobUrl });
         });
+      } catch {
+        // caching is an optimisation; the <img> already shows the URL
       }
     };
     img.src = url;
-  }, [isVisible, docId, pageIndex, pageVersion]);
+    return () => { cancelled = true; };
+  }, [isVisible, url, key, docId, pageIndex, pageVersion]);
 
   return (
     <div ref={containerRef} className="w-full aspect-[3/4] bg-gray-50 dark:bg-gray-800">

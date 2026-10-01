@@ -1,9 +1,19 @@
 fastapi>=0.100.0,<1.0.0
 uvicorn>=0.20.0,<1.0.0
-PyMuPDF>=1.23.0,<2.0.0
+PyMuPDF>=1.27.0,<1.28.0          # feature modules are tested against 1.27.x
 pydantic>=2.0.0,<3.0.0
 anthropic>=0.40.0,<1.0.0
 python-multipart>=0.0.6,<1.0.0
+
+# Feature modules (backend/features/)
+Pillow>=10.0.0,<13.0.0          # objects (image crop/replace), sign (PNG alpha), convert (compress)
+numpy>=1.26.0,<3.0.0            # organize: auto-crop raster scan
+pyhanko>=0.37.0,<0.38.0         # sign: PAdES digital signatures + validation
+cryptography>=42.0.0            # sign: self-signed digital IDs (also pulled in by pyhanko)
+pdf2docx>=0.5.8,<0.6.0          # convert: PDF -> DOCX (pulls in python-docx, opencv-python-headless)
+python-docx>=1.1.0,<2.0.0       # convert: DOCX -> PDF best-effort path
+openpyxl>=3.1.0,<4.0.0          # convert: PDF tables -> XLSX
+# OCR also needs the Tesseract binary + tessdata on the host (see backend/Dockerfile).
 
 # Testing
 pytest>=8.0.0

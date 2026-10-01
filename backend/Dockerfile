@@ -2,9 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for PyMuPDF
+# System dependencies: gcc for wheels that build from source, Tesseract + English
+# tessdata for OCR (convert feature), libglib2.0-0 for opencv-python-headless
+# (pulled in by pdf2docx).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

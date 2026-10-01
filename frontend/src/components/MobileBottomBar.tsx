@@ -1,31 +1,18 @@
 "use client";
 
-import {
-  MousePointer2,
-  Type,
-  Highlighter,
-  Pencil,
-  Layers,
-  Eraser,
-  ScanSearch,
-} from "lucide-react";
-import { useEditorStore, type Tool } from "@/lib/store";
+import { Layers } from "lucide-react";
+import { useEditorStore } from "@/lib/store";
+import { MODES, activateMode, isModeActive } from "@/lib/modes";
 
-const tools: { id: Tool; icon: typeof MousePointer2; label: string }[] = [
-  { id: "select", icon: MousePointer2, label: "Select" },
-  { id: "region_select", icon: ScanSearch, label: "Region" },
-  { id: "text", icon: Type, label: "Text" },
-  { id: "highlight", icon: Highlighter, label: "Mark" },
-  { id: "draw", icon: Pencil, label: "Draw" },
-  { id: "eraser", icon: Eraser, label: "Erase" },
-];
+// The most-used modes; the full list lives in the Toolbar's mobile menu.
+const QUICK = ["select", "edit_text", "comment", "sign", "forms", "organize"];
+const quickModes = MODES.filter((m) => QUICK.includes(m.id));
 
 export default function MobileBottomBar() {
-  const { activeTool, setActiveTool, sidebarOpen, toggleSidebar, docId } =
+  const { activeTool, setActiveTool, sidebarOpen, toggleSidebar, docId, activePanel, organizeOpen, togglePanel, setOrganizeOpen } =
     useEditorStore();
 
   if (!docId) return null;
-
   return (
     <div className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm border-t border-gray-200 dark:border-gray-800 safe-area-bottom">
       <div className="flex items-center justify-around py-1.5 px-1">
@@ -41,12 +28,12 @@ export default function MobileBottomBar() {
           <span className="text-[10px] font-medium">Pages</span>
         </button>
 
-        {tools.map((tool) => (
+        {quickModes.map((tool) => (
           <button
             key={tool.id}
-            onClick={() => setActiveTool(tool.id)}
+            onClick={() => activateMode(tool, { setActiveTool, togglePanel, setOrganizeOpen, organizeOpen })}
             className={`flex flex-col items-center gap-0.5 p-1.5 rounded-lg transition-colors ${
-              activeTool === tool.id
+              isModeActive(tool, { activeTool, activePanel, organizeOpen })
                 ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30"
                 : "text-gray-500 dark:text-gray-400 active:bg-gray-100 dark:active:bg-gray-800"
             }`}

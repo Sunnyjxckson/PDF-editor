@@ -3,6 +3,7 @@
 import { X } from "lucide-react";
 import { useEditorStore } from "@/lib/store";
 import * as Dialog from "@radix-ui/react-dialog";
+import { MODES, shortcutLabel } from "@/lib/modes";
 
 const shortcuts = [
   { section: "Navigation", items: [
@@ -12,18 +13,16 @@ const shortcuts = [
     { keys: ["-"], desc: "Zoom out" },
     { keys: ["0"], desc: "Reset zoom to 100%" },
   ]},
-  { section: "Tools", items: [
-    { keys: ["V"], desc: "Select tool" },
-    { keys: ["S"], desc: "Select Region tool" },
-    { keys: ["T"], desc: "Text tool" },
-    { keys: ["H"], desc: "Highlight tool" },
-    { keys: ["D"], desc: "Draw tool" },
-    { keys: ["E"], desc: "Eraser tool" },
-  ]},
+  { section: "Tools", items: MODES.filter((m) => m.shortcut).map((m) => ({ keys: [shortcutLabel(m.shortcut!)], desc: m.label })) },
   { section: "Panels", items: [
     { keys: ["Ctrl", "/"], desc: "Toggle AI Chat" },
     { keys: ["Ctrl", "F"], desc: "Find & Replace" },
     { keys: ["["], desc: "Toggle page sidebar" },
+  ]},
+  { section: "Editing", items: [
+    { keys: ["Ctrl/Cmd", "Z"], desc: "Undo (any change, from any tool)" },
+    { keys: ["Ctrl/Cmd", "Shift", "Z"], desc: "Redo" },
+    { keys: ["Delete"], desc: "Delete the selected object / field / signature" },
   ]},
   { section: "General", items: [
     { keys: ["?"], desc: "Show keyboard shortcuts" },

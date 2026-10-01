@@ -23,7 +23,8 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/pdf")
 
-UPLOAD_DIR = Path("uploads")
+# Same rule as main.py so undo history and documents live in one tree.
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "uploads"))
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -431,16 +432,27 @@ async def delete_image(doc_id: str, page: int, index: int):
 
     xref = img_list[index][0]
     try:
+        # apply_redactions() burns in EVERY Redact annot on the page, so park the
+        # user's pending redaction marks first and put them back afterwards.
+        from backend.features.redact import _stash_marks, _restore_marks
+        stash = _stash_marks(doc, pg)
         rects = pg.get_image_rects(xref)
         for rect in rects:
             pg.add_redact_annot(rect)
-        pg.apply_redactions()
+        # Remove only the image: text and vector art over/under it must survive.
+        pg.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_REMOVE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_NONE,
+        )
+        _restore_marks(pg, stash)
     except Exception:
         doc.close()
         raise HTTPException(status_code=500, detail="Failed to remove image")
 
     out_path = str(file_path) + ".tmp"
-    doc.save(out_path)
+    # garbage>=3 so the removed image is not left in the file as an orphan object.
+    doc.save(out_path, garbage=3, deflate=True)
     doc.close()
     os.replace(out_path, str(file_path))
 
@@ -532,6 +544,13 @@ async def convert_pdfa(doc_id: str):
 
     doc = fitz.open(str(file_path))
 
+    # Flatten form fields and annotations into the page first, so the filled
+    # values survive (scrub(reset_fields=True) alone would blank them).
+    try:
+        doc.bake(annots=False, widgets=True)
+    except Exception:
+        pass
+
     # Remove JavaScript actions
     try:
         doc.scrub(
@@ -544,7 +563,7 @@ async def convert_pdfa(doc_id: str):
             redactions=False,
             redact_images=0,
             remove_links=False,
-            reset_fields=True,
+            reset_fields=False,
             reset_responses=True,
             thumbnails=True,
             xml_metadata=False,
@@ -572,39 +591,35 @@ async def convert_pdfa(doc_id: str):
 
 @router.post("/{doc_id}/flatten")
 async def flatten_annotations(doc_id: str):
-    """Flatten all annotations into page content."""
+    """Flatten all annotations and form fields into page content.
+
+    Uses Document.bake(), which draws each annotation's appearance stream into
+    the page before removing it. (The old implementation only deleted the
+    annotations, so highlights, ink, comments and filled form values vanished.)
+    Pending redaction marks are kept as marks: baking them would draw the box
+    without removing the text underneath, which looks redacted but is not.
+    """
+    from backend.features.redact import _stash_marks, _restore_marks
+
     file_path = get_doc_path(doc_id)
-    snapshot(doc_id, "Flatten annotations")
-
     doc = fitz.open(str(file_path))
-    flattened_count = 0
-
-    for page in doc:
-        annots = list(page.annots()) if page.annots() else []
-        for annot in annots:
-            # Render annotation into the page
-            annot.set_flags(fitz.PDF_ANNOT_IS_PRINT)
-            annot.update()
-            flattened_count += 1
-
-    # Save and re-open to "burn in" annotations
-    tmp1 = str(file_path) + ".tmp1"
-    doc.save(tmp1)
-    doc.close()
-
-    # Re-open, remove annotation objects (they're now part of appearance streams)
-    doc = fitz.open(tmp1)
-    for page in doc:
-        annots = list(page.annots()) if page.annots() else []
-        for annot in annots:
-            page.delete_annot(annot)
-
-    out_path = str(file_path) + ".tmp"
-    doc.save(out_path)
-    doc.close()
+    try:
+        flattened_count = 0
+        stashes: dict[int, list] = {}
+        for page in doc:
+            stash = _stash_marks(doc, page)
+            if stash:
+                stashes[page.number] = stash
+            flattened_count += len(list(page.annots())) + len(list(page.widgets()))
+        snapshot(doc_id, "Flatten annotations")
+        doc.bake(annots=True, widgets=True)
+        for pno, stash in stashes.items():
+            _restore_marks(doc[pno], stash)
+        out_path = str(file_path) + ".tmp"
+        doc.save(out_path, garbage=3, deflate=True)
+    finally:
+        doc.close()
     os.replace(out_path, str(file_path))
-    if os.path.exists(tmp1):
-        os.unlink(tmp1)
 
     return {"status": "ok", "flattened": flattened_count}
 
