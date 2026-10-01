@@ -247,7 +247,6 @@ MUTATIONS = [
     ("add_watermark", {"text": "DRAFT"}, lambda d: "DRAFT" in d[0].get_text()),
     ("protect_document", {"owner_password": "owner-pw-123"},
      lambda d: bool(d.metadata.get("encryption"))),
-    ("sanitize_document", {"metadata": True}, lambda d: True),
     ("run_ocr", {"pages": [2]}, lambda d: "Invoice" in d[1].get_text()),
 ]
 
@@ -257,10 +256,6 @@ async def test_mutating_tool_dispatch_snapshots_and_undo(client, rich, name, inp
     if inp.get("xref") == "XREF":
         with open_pdf(rich) as d:
             inp = dict(inp, xref=d[0].get_images()[0][0])
-    if name == "sanitize_document":
-        with fitz.open(str(pdf_path(rich))) as d:
-            d.set_metadata({"author": "Secret Author", "title": "T"})
-            d.saveIncr()
     before = sha(rich)
     h0 = history(rich)
 
@@ -268,10 +263,7 @@ async def test_mutating_tool_dispatch_snapshots_and_undo(client, rich, name, inp
     assert out.ok, out.content
     assert out.changed, f"{name} reported no change"
     with open_pdf(rich) as d:
-        if name == "sanitize_document":
-            assert "Secret Author" not in (d.metadata.get("author") or "")
-        else:
-            assert check(d), f"{name}: PDF does not show the change"
+        assert check(d), f"{name}: PDF does not show the change"
     assert ctx.changes and ctx.changes[0]["tool"] == name and ctx.changes[0]["undoable"]
 
     # exactly ONE new history entry, labelled as an AI change, holding the pre-op file
@@ -309,6 +301,21 @@ async def test_apply_redactions_tool_is_real_and_purges_history(rich):
     assert ctx.changes[0]["undoable"] is False
 
 
+async def test_sanitize_tool_is_real_and_purges_history(rich):
+    with fitz.open(str(pdf_path(rich))) as d:
+        d.set_metadata({"author": "Secret Author", "title": "T"})
+        d.saveIncr()
+    await run_tool(rich, "add_watermark", {"text": "DRAFT"})
+    assert history(rich)
+    out, ctx = await run_tool(rich, "sanitize_document", {"metadata": True})
+    assert out.ok and out.changed
+    with open_pdf(rich) as d:
+        assert "Secret Author" not in (d.metadata.get("author") or "")
+    # hidden data never survives in a pre-sanitize snapshot
+    assert history(rich) == []
+    assert ctx.changes[0]["undoable"] is False
+
+
 async def test_undo_and_redo_tools(rich):
     await run_tool(rich, "add_watermark", {"text": "DRAFT"})
     out, _ = await run_tool(rich, "undo", {"steps": 1})
@@ -339,12 +346,12 @@ def test_every_registered_tool_has_a_dispatch_test():
         "find_paragraph", "list_objects", "list_form_fields", "list_bookmarks", "list_comments",
         "extract_tables", "security_audit", "get_edit_history", "read_reference_document",
         "compare_with_reference", "export_document", "create_download", "find_redaction_candidates",
-        "propose_redactions", "apply_redactions", "undo", "redo"}
+        "propose_redactions", "apply_redactions", "sanitize_document", "undo", "redo"}
     assert set(ai_engine.TOOLS_REGISTRY) == tested
     for d in ai_engine.tool_definitions():
         assert d["input_schema"]["type"] == "object" and d["description"]
     mut = {n for n, s in ai_engine.TOOLS_REGISTRY.items() if s.mutating}
-    assert mut == {m[0] for m in MUTATIONS} | {"apply_redactions"}
+    assert mut == {m[0] for m in MUTATIONS} | {"apply_redactions", "sanitize_document"}
 
 
 # ─── citations ───────────────────────────────────────────────────────────────

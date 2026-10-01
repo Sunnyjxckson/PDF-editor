@@ -1210,10 +1210,11 @@ async def t_protect(ctx: AgentCtx, inp: dict) -> ToolOut:
     return ToolOut("protected with AES-256", "protected document")
 
 
-@tool("sanitize_document", "Remove hidden information: metadata, JavaScript, embedded files, hidden text...",
+@tool("sanitize_document", "Remove hidden information: metadata, JavaScript, embedded files, hidden text... "
+      "Like apply_redactions this clears the undo history (by design), so it cannot be undone.",
       {k: {"type": "boolean"} for k in ("metadata", "javascript", "embedded_files", "hidden_text", "links",
                                         "annotations", "form_data")},
-      mutating=True, label=lambda i: "sanitize document")
+      mutating=True, snapshot=False, label=lambda i: "sanitize document")
 async def t_sanitize(ctx: AgentCtx, inp: dict) -> ToolOut:
     data = await ctx.call("POST", f"/api/pdf/{ctx.doc_id}/security/sanitize", {k: v for k, v in inp.items()})
     return ToolOut(_j(data), "sanitized document")
@@ -1306,8 +1307,9 @@ apply_redactions if the user explicitly says to redact without review.
 - Form filling: call list_form_fields, map the user's profile or the reference document to field names, \
 then fill_form. Never guess values you do not have; list what is missing. For flat forms, use \
 detect_form_fields (and view_page + create_form_field for anything it misses).
-- Every change you make is undoable. After changing the document, end with a short bulleted summary of \
-exactly what changed and tell the user they can undo it.
+- Every change you make is undoable EXCEPT apply_redactions and sanitize_document, which clear the undo \
+history by design. After changing the document, end with a short bulleted summary of exactly what changed \
+and tell the user whether they can undo it.
 - If a tool reports the document is digitally signed, stop and ask the user; never work around it.
 - Ask before destructive actions the user did not clearly request (deleting pages, applying redactions).
 - Do not reveal passwords in your replies.
